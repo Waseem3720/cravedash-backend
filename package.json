@@ -1,0 +1,35 @@
+{
+  "name": "cravedash-backend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "CraveDash microservices — API, PostgreSQL, React frontend",
+  "workspaces": [
+    "shared",
+    "services/*"
+  ],
+  "scripts": {
+    "db:start": "node scripts/start-embedded-db.js",
+    "migrate": "node shared/scripts/migrate.js",
+    "seed": "node scripts/seed-full.js",
+    "setup": "node scripts/setup-local.js",
+    "dev": "node scripts/dev-all.js",
+    "dev:gateway": "node services/gateway/src/index.js",
+    "dev:auth": "node services/auth-service/src/index.js",
+    "dev:catalog": "node services/catalog-service/src/index.js",
+    "dev:order": "node services/order-service/src/index.js",
+    "dev:restaurant": "node services/restaurant-service/src/index.js",
+    "dev:platform": "node services/platform-service/src/index.js",
+    "dev:epos": "node services/epos-service/src/index.js",
+    "dev:reporting": "node services/reporting-service/src/index.js",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:all": "node scripts/dev-stack.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "embedded-postgres": "^18.4.0-beta.17"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@cravedash/database",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CraveDash PostgreSQL migrations and seeds",
+  "scripts": {
+    "migrate": "node ../shared/scripts/migrate.js",
+    "seed:sql": "psql \"$DATABASE_URL\" -f seeds/001_seed.sql",
+    "seed": "node seeds/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.0"
+  }
+}

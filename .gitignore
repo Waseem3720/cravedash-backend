@@ -1,0 +1,9 @@
+node_modules/
+.pgdata/
+pgdata/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+*.pid
