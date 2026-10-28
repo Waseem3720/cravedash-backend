@@ -5,9 +5,9 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const vm = require('vm');
-const pool = require('../shared/src/db');
 
-require('dotenv').config({ path: path.join(__dirname, '../.env') });
+require('dotenv').config({ path: process.env.DOTENV_PATH || path.join(__dirname, '../.env') });
+const pool = require('../shared/src/db');
 
 if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_SEED !== '1') {
   console.error('[seed-full] Refusing to run in production (known demo passwords). Set ALLOW_DEMO_SEED=1 to override.');
@@ -149,11 +149,18 @@ async function main() {
   ];
   for (const [id, liveId, name, owner, plan, st] of extraRestaurants) {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const ownerEmail = `owner@${slug}.example`;
     await upsert(
       `INSERT INTO restaurants (id, live_id, name, owner, email, phone, address, city, plan_id, sub_status, status, data)
        VALUES ($1,$2,$3,$4,$5,$6,'',$7,$8,$9,TRUE,'{}'::jsonb)
        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, plan_id = EXCLUDED.plan_id, sub_status = EXCLUDED.sub_status`,
-      [id, liveId, name, owner, `owner@${slug}.example`, '0141 000 0000', 'United Kingdom', plan, st],
+      [id, liveId, name, owner, ownerEmail, '0141 000 0000', 'United Kingdom', plan, st],
+    );
+    await upsert(
+      `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+       VALUES ($1,$2,$3,'restaurant',$4,$5)
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, restaurant_id = EXCLUDED.restaurant_id, role = 'restaurant'`,
+      [`u_${id}`, ownerEmail, hash, owner, id],
     );
   }
 
@@ -190,6 +197,70 @@ async function main() {
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
     ['u_epos_legacy', 'till@portopiripiri.example', hash, 'Till User'],
   );
+
+  console.log('Seeding remaining roles: rider, chef, and customer…');
+  try {
+    await upsert(
+      `INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, password_hash, data)
+       VALUES ($1,'r1',$2,$3,$4,$5,'active',$6,$7::jsonb)
+       ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data`,
+      ['dm_1', 'Dave Rider', '07700900111', 'rider@portopiripiri.example', 'motorcycle', hash, JSON.stringify({ password_hash: hash })],
+    );
+  } catch (e) {
+    console.warn('Note: deliverymen table seed skipped or failed:', e.message);
+  }
+  try {
+    await upsert(
+      `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+       VALUES ($1,$2,$3,'rider',$4,'r1')
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'rider'`,
+      ['u_rider', 'rider@portopiripiri.example', hash, 'Dave Rider'],
+    );
+  } catch (e) {
+    console.warn('Note: users rider seed skipped:', e.message);
+  }
+
+  try {
+    await upsert(
+      `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, password_hash, data)
+       VALUES ($1,'r1',$2,$3,$4,TRUE,$5,$6::jsonb)
+       ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data`,
+      ['chef_1', 'Gordon Chef', 'chef@portopiripiri.example', '07700900222', hash, JSON.stringify({ password_hash: hash })],
+    );
+  } catch (e) {
+    console.warn('Note: chefs table seed skipped or failed:', e.message);
+  }
+  try {
+    await upsert(
+      `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+       VALUES ($1,$2,$3,'chef',$4,'r1')
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'chef'`,
+      ['u_chef', 'chef@portopiripiri.example', hash, 'Gordon Chef'],
+    );
+  } catch (e) {
+    console.warn('Note: users chef seed skipped:', e.message);
+  }
+
+  try {
+    await upsert(
+      `INSERT INTO customers (id, restaurant_id, name, email, phone, status, data)
+       VALUES ($1,'r1',$2,$3,$4,TRUE,$5::jsonb)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, status = EXCLUDED.status`,
+      ['cust_1', 'Alice Customer', 'customer@cravedash.co.uk', '07700900333', JSON.stringify({ password_hash: hash, f_name: 'Alice', l_name: 'Customer' })],
+    );
+  } catch (e) {
+    console.warn('Note: customers table seed skipped or failed:', e.message);
+  }
+  try {
+    await upsert(
+      `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+       VALUES ($1,$2,$3,'customer',$4,'r1')
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'customer'`,
+      ['u_customer', 'customer@cravedash.co.uk', hash, 'Alice Customer'],
+    );
+  } catch (e) {
+    console.warn('Note: users customer seed skipped:', e.message);
+  }
 
   console.log('Seeding till staff PINs…');
   const staff = [

@@ -1,17 +1,25 @@
+x-common-env: &common-env
+  LISTEN_HOST: "0.0.0.0"
+  PGHOST: postgres
+  PGPORT: 5432
+  PGUSER: ${PGUSER:-cravedash}
+  PGPASSWORD: ${PGPASSWORD:-cravedash}
+  PGDATABASE: ${PGDATABASE:-cravedash}
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: cravedash
-      POSTGRES_PASSWORD: cravedash
-      POSTGRES_DB: cravedash
+      POSTGRES_USER: ${PGUSER:-cravedash}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-cravedash}
+      POSTGRES_DB: ${PGDATABASE:-cravedash}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cravedash -d cravedash"]
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -20,13 +28,7 @@ services:
     build: .
     command: ["node", "shared/scripts/migrate.js"]
     env_file: .env
-    environment:
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
+    environment: *common-env
     depends_on:
       postgres:
         condition: service_healthy
@@ -36,13 +38,8 @@ services:
     command: ["node", "services/gateway/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4000
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
       AUTH_SERVICE_URL: http://auth:4001
       CATALOG_SERVICE_URL: http://catalog:4002
       ORDER_SERVICE_URL: http://order:4003
@@ -75,13 +72,8 @@ services:
     command: ["node", "services/auth-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4001
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,13 +85,8 @@ services:
     command: ["node", "services/catalog-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4002
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,13 +98,8 @@ services:
     command: ["node", "services/order-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4003
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,13 +111,8 @@ services:
     command: ["node", "services/restaurant-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4004
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -147,13 +124,8 @@ services:
     command: ["node", "services/platform-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4005
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -165,13 +137,8 @@ services:
     command: ["node", "services/epos-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4006
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
@@ -183,27 +150,13 @@ services:
     command: ["node", "services/reporting-service/src/index.js"]
     env_file: .env
     environment:
+      <<: *common-env
       PORT: 4007
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       postgres:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-
-  frontend:
-    image: nginx:alpine
-    ports:
-      - "8080:80"
-    volumes:
-      - ./frontend/public:/usr/share/nginx/html:ro
-    depends_on:
-      - gateway
 
 volumes:
   pgdata:

@@ -17,6 +17,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
+// Ensure root .env is loaded when run directly from CLI (npm run migrate)
+require('dotenv').config({ path: process.env.DOTENV_PATH || path.resolve(__dirname, '../../.env') });
+
 // Normalized SHA-256 calculation (handles cross-platform line endings)
 function computeChecksum(content) {
   const normalized = content.replace(/\r\n/g, '\n').trimEnd();
@@ -163,14 +166,32 @@ async function runMigrations(options = {}) {
     3600000
   );
 
-  const pool = options.pool || new Pool({
-    connectionString: process.env.DATABASE_URL,
-    host: process.env.PGHOST || 'localhost',
-    port: +(process.env.PGPORT || 5432),
-    user: process.env.PGUSER || 'cravedash',
-    password: process.env.PGPASSWORD || 'cravedash',
-    database: process.env.PGDATABASE || 'cravedash',
-  });
+  const poolConfig = options.pool
+    ? null
+    : process.env.PGHOST
+      ? {
+          host: process.env.PGHOST,
+          port: +(process.env.PGPORT || 5432),
+          user: process.env.PGUSER || 'cravedash',
+          password: process.env.PGPASSWORD || 'cravedash',
+          database: process.env.PGDATABASE || 'cravedash',
+          max: +(process.env.PGPOOL_MAX || 10),
+        }
+      : process.env.DATABASE_URL
+        ? {
+            connectionString: process.env.DATABASE_URL,
+            max: +(process.env.PGPOOL_MAX || 10),
+          }
+        : {
+            host: 'localhost',
+            port: +(process.env.PGPORT || 5432),
+            user: process.env.PGUSER || 'cravedash',
+            password: process.env.PGPASSWORD || 'cravedash',
+            database: process.env.PGDATABASE || 'cravedash',
+            max: +(process.env.PGPOOL_MAX || 10),
+          };
+
+  const pool = options.pool || new Pool(poolConfig);
 
   const client = await pool.connect();
   const advisoryLockId = 8675309; // CraveDash migration lock key

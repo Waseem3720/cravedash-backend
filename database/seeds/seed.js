@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
+require('dotenv').config({ path: process.env.DOTENV_PATH || require('path').join(__dirname, '../../.env') });
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -381,7 +381,25 @@ async function main() {
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
   const pinHash = async (pin) => bcrypt.hash(pin, 10);
 
-  const client = new Client({ connectionString: DATABASE_URL });
+  const clientConfig = process.env.PGHOST
+    ? {
+        host: process.env.PGHOST,
+        port: +(process.env.PGPORT || 5432),
+        user: process.env.PGUSER || 'cravedash',
+        password: process.env.PGPASSWORD || 'cravedash',
+        database: process.env.PGDATABASE || 'cravedash',
+      }
+    : process.env.DATABASE_URL
+      ? { connectionString: DATABASE_URL }
+      : {
+          host: 'localhost',
+          port: +(process.env.PGPORT || 5432),
+          user: process.env.PGUSER || 'cravedash',
+          password: process.env.PGPASSWORD || 'cravedash',
+          database: process.env.PGDATABASE || 'cravedash',
+        };
+
+  const client = new Client(clientConfig);
   await client.connect();
 
   try {

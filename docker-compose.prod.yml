@@ -1,81 +1,100 @@
-# CraveDash production stack (standalone).
+# ==============================================================================
+# CraveDash Production Docker Compose Stack
 # Usage on VPS:
-#   cd /opt/cravedash
-#   docker compose -p cravedash -f docker-compose.prod.yml up -d --build
-#
-# Gateway is only on 127.0.0.1:4100 (Apache proxies https://crave.../api → here).
-# Postgres is not published on the host.
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Optional demo seed:
+#   docker compose -f docker-compose.prod.yml --profile seed up seed
+# ==============================================================================
 
 name: cravedash
 
+x-common-env: &common-env
+  NODE_ENV: production
+  PGHOST: postgres
+  PGPORT: 5432
+  PGUSER: ${PGUSER:-cravedash}
+  PGPASSWORD: ${PGPASSWORD:?Database password (PGPASSWORD) must be set in production .env}
+  PGDATABASE: ${PGDATABASE:-cravedash}
+
+x-service-env: &service-env
+  <<: *common-env
+  LISTEN_HOST: "0.0.0.0"
+
+x-service-defaults: &service-defaults
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  networks: [cravedash]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+
 services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL Database (Internal only, not exposed on host ports)
+  # ----------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: cravedash
-      POSTGRES_PASSWORD: ${PGPASSWORD:-cravedash}
-      POSTGRES_DB: cravedash
+      POSTGRES_USER: ${PGUSER:-cravedash}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?Database password (PGPASSWORD) must be set in production .env}
+      POSTGRES_DB: ${PGDATABASE:-cravedash}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cravedash -d cravedash"]
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}"]
       interval: 5s
       timeout: 5s
       retries: 15
-    restart: unless-stopped
     networks: [cravedash]
 
+  # ----------------------------------------------------------------------------
+  # Database Migrations (Runs sequentially once on boot, then terminates)
+  # ----------------------------------------------------------------------------
   migrate:
     build: .
     command: ["node", "shared/scripts/migrate.js"]
+    restart: "no"
     env_file: .env
-    environment:
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
+    environment: *common-env
     depends_on:
       postgres:
         condition: service_healthy
     networks: [cravedash]
-    restart: "no"
 
+  # ----------------------------------------------------------------------------
+  # Optional Demo / Initial Seed (Runs only when explicitly requested)
+  # ----------------------------------------------------------------------------
   seed:
     build: .
     profiles: ["seed"]
     command: ["node", "scripts/seed-full.js"]
+    restart: "no"
     env_file: .env
     environment:
-      NODE_ENV: production
+      <<: *common-env
       ALLOW_DEMO_SEED: "1"
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
     depends_on:
       migrate:
         condition: service_completed_successfully
     networks: [cravedash]
-    restart: "no"
 
+  # ----------------------------------------------------------------------------
+  # API Gateway (Public edge proxy; bound only to loopback port 4100 on host)
+  # ----------------------------------------------------------------------------
   gateway:
     build: .
     command: ["node", "services/gateway/src/index.js"]
+    restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV: production
+      <<: *common-env
       PORT: 4000
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
+      GATEWAY_PORT: 4000
       AUTH_SERVICE_URL: http://auth:4001
       CATALOG_SERVICE_URL: http://catalog:4002
       ORDER_SERVICE_URL: http://order:4003
@@ -102,164 +121,69 @@ services:
         condition: service_started
       reporting:
         condition: service_started
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:4000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks: [cravedash]
 
+  # ----------------------------------------------------------------------------
+  # Internal Backend Microservices
+  # ----------------------------------------------------------------------------
   auth:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/auth-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      # Docker network: must not bind loopback-only or gateway cannot reach services
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4001
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   catalog:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/catalog-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4002
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   order:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/order-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4003
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   restaurant:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/restaurant-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4004
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   platform:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/platform-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4005
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   epos:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/epos-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4006
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
   reporting:
-    build: .
+    <<: *service-defaults
     command: ["node", "services/reporting-service/src/index.js"]
-    env_file: .env
     environment:
-      NODE_ENV: production
-      LISTEN_HOST: "0.0.0.0"
+      <<: *service-env
       PORT: 4007
-      PGHOST: postgres
-      PGPORT: 5432
-      PGUSER: cravedash
-      PGPASSWORD: ${PGPASSWORD:-cravedash}
-      PGDATABASE: cravedash
-      DATABASE_URL: postgres://cravedash:${PGPASSWORD:-cravedash}@postgres:5432/cravedash
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    networks: [cravedash]
 
+# ------------------------------------------------------------------------------
+# Networks & Persistent Volumes
+# ------------------------------------------------------------------------------
 networks:
   cravedash:
     name: cravedash_net

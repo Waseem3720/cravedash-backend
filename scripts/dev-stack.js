@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const net = require('net');
+const fs = require('fs');
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
@@ -72,18 +73,20 @@ async function main() {
   // API services
   require('./dev-all.js');
 
-  // Frontend
-  const fe = spawn(
-    process.platform === 'win32' ? 'npm.cmd' : 'npm',
-    ['run', 'dev', '--prefix', 'frontend'],
-    { cwd: root, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-  fe.stdout.on('data', (d) => process.stdout.write(`[frontend] ${d}`));
-  fe.stderr.on('data', (d) => process.stderr.write(`[frontend] ${d}`));
-  children.push(fe);
+  // Frontend (spawn only if directory exists)
+  if (fs.existsSync(path.join(root, 'frontend'))) {
+    const fe = spawn(
+      process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      ['run', 'dev', '--prefix', 'frontend'],
+      { cwd: root, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    fe.stdout.on('data', (d) => process.stdout.write(`[frontend] ${d}`));
+    fe.stderr.on('data', (d) => process.stderr.write(`[frontend] ${d}`));
+    children.push(fe);
+    console.log('[stack] Frontend   http://localhost:5173');
+  }
 
   console.log('[stack] API gateway http://localhost:4000');
-  console.log('[stack] Frontend   http://localhost:5173');
 }
 
 main().catch((e) => {

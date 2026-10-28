@@ -35,7 +35,7 @@ The API Gateway will be available at `http://127.0.0.1:4000` (health probe: `htt
 ## 2. Deploy on Linux Server
 
 ### 1. Production Environment Setup
-In the deployment directory on the Linux host (e.g. `/opt/cravedash`):
+In the deployment directory on the Linux host (e.g. `/opt/cravedash-node`):
 ```bash
 cp .env.example .env
 ```
@@ -43,27 +43,27 @@ Configure `.env` with production parameters:
 - `NODE_ENV=production`
 - `PGPASSWORD`: Set secure database password (`NEEDS CONFIGURATION`)
 - `JWT_SECRET`: Set strong random secret (`NEEDS CONFIGURATION`)
+- `INTEGRATIONS_SECRET_KEY`: Set encryption secret (min 16 chars) for integration credentials at rest (`NEEDS CONFIGURATION`)
 - `CORS_ORIGIN`: Explicit comma-separated origins without wildcards, e.g. `https://admin.yourdomain.com,https://app.yourdomain.com` (`NEEDS CONFIGURATION` — wildcards or unset values trigger fatal exit in production)
 - `GATEWAY_JWT_VERIFY=optional` (or `strict`; must not be `off` in production)
-- `DATA_ENCRYPTION_KEY`: 32-byte key for encryption at rest (`NEEDS CONFIGURATION`)
-- `STRIPE_SECRET_KEY`: Stripe API secret key (`NEEDS CONFIGURATION`)
-- `STRIPE_WEBHOOK_SECRET`: Stripe webhook signing secret (`NEEDS CONFIGURATION`)
+- `STRIPE_SECRET_KEY`: Optional platform Stripe secret key (`NEEDS CONFIGURATION` if Stripe billing is used)
+- `STRIPE_WEBHOOK_SECRET`: Optional Stripe webhook signing secret (`NEEDS CONFIGURATION` if Stripe webhooks are used)
 
 ### 2. Deploy Stack with Docker Compose
 Build images, initialize PostgreSQL, apply migrations, and start all services in detached mode:
 ```bash
-docker compose -p cravedash -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 *(Optional) Seed initial demo/platform data if needed:*
 ```bash
-docker compose -p cravedash -f docker-compose.prod.yml --profile seed up seed
+docker compose -f docker-compose.prod.yml --profile seed up seed
 ```
 
 ### 3. Basic Verification
 Verify container status and health checks:
 ```bash
-docker compose -p cravedash -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml ps
 ```
 
 Verify API Gateway response on the published loopback port `4100` (the stack publishes `127.0.0.1:4100:4000` for reverse proxying):
@@ -74,5 +74,5 @@ curl -i http://127.0.0.1:4100/
 
 Inspect service and gateway logs:
 ```bash
-docker compose -p cravedash -f docker-compose.prod.yml logs -f gateway
+docker compose -f docker-compose.prod.yml logs -f gateway
 ```

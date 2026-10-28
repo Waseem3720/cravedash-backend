@@ -1,6 +1,6 @@
 FROM node:20-alpine
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json* ./
 COPY shared/package.json ./shared/
 COPY services/gateway/package.json ./services/gateway/
 COPY services/auth-service/package.json ./services/auth-service/
