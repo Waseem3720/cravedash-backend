@@ -1,4 +1,4 @@
-# CraveDash Backend
+# CraveDash Backend CI/CD
 
 ## 1. Run Locally
 
