@@ -18,7 +18,7 @@ function assertFullSession(claims) {
 
 function optionalAuth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query?.token || null);
   if (!token) return next();
   try {
     req.user = assertFullSession(verify(token));
@@ -31,7 +31,7 @@ function optionalAuth(req, res, next) {
 
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query?.token || null);
   if (!token) return next(unauthorized('Missing token'));
   try {
     req.user = assertFullSession(verify(token));
@@ -66,10 +66,6 @@ function restaurantId(req) {
   // Public storefront / edge requests validated via X-API-KEY set x-restaurant-id downstream
   if (req.headers && req.headers['x-restaurant-id']) {
     return req.headers['x-restaurant-id'];
-  }
-  // Storefront single-tenant / default restaurant fallback
-  if (process.env.DEFAULT_RESTAURANT_ID || 'r1') {
-    return process.env.DEFAULT_RESTAURANT_ID || 'r1';
   }
   throw badRequest('restaurant_id missing from session');
 }

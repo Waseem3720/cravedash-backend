@@ -3,8 +3,8 @@ const { badRequest, notFound } = require('../errors');
 
 /**
  * Authoritatively validates deal combo slot selections, checks repeat rules,
- * verifies allowed/excluded products and addons against the database, and
- * calculates the authoritative total deal price.
+ * verifies allowed items/names against the database, and calculates
+ * the authoritative total deal price and savings.
  *
  * @param {string} restaurantId - The tenant restaurant ID
  * @param {object} body - Request body containing deal_id and slot selections
@@ -19,8 +19,8 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
   if (!dealId) throw badRequest('deal_id is required');
 
   const { rows: dealRows } = await db.query(
-    'SELECT * FROM deals WHERE id = $1 AND restaurant_id = $2 AND status = true',
-    [dealId, restaurantId]
+    "SELECT * FROM deals WHERE (id = $1 OR id = regexp_replace($1, '^deal[-_]', '')) AND restaurant_id = $2 AND status = true LIMIT 1",
+    [String(dealId), restaurantId]
   );
   const deal = dealRows[0];
   if (!deal) throw notFound('Deal not found or inactive');
@@ -35,7 +35,7 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
   }
   if (!Array.isArray(slotsDef)) slotsDef = [];
 
-  const rawSelections = body.items || body.selections || body.slots || [];
+  const rawSelections = body.selections || body.items || body.slots || [];
   let selectionList = [];
   if (Array.isArray(rawSelections)) {
     selectionList = rawSelections;
@@ -49,7 +49,10 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
     }
   }
 
-  const basePrice = Number(deal.price) || 0;
+  const basePrice = Number(Number(deal.price).toFixed(2)) || 0;
+  const dealData = deal.data && typeof deal.data === 'object' ? deal.data : {};
+  const wasPrice = Number(Number(deal.was_price != null ? deal.was_price : (dealData.was_price != null ? dealData.was_price : basePrice)).toFixed(2));
+
   let extraCharges = 0;
   const verifiedSlots = [];
   const lineItemDetails = [];
@@ -58,7 +61,7 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
   for (let idx = 0; idx < slotsDef.length; idx++) {
     const slot = slotsDef[idx] || {};
     const slotId = slot.id != null ? String(slot.id) : String(idx);
-    const slotName = slot.name || `Slot ${idx + 1}`;
+    const slotName = slot.label || slot.name || `Slot ${idx + 1}`;
     const requiredQty = Number(slot.required ?? slot.quantity ?? slot.min ?? 1);
     const allowRepeats = slot.allow_repeats !== false && slot.repeatable !== false;
     const allowedProductIds = Array.isArray(slot.product_ids) && slot.product_ids.length
@@ -79,53 +82,64 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
       throw badRequest(`Slot "${slotName}" requires exactly ${requiredQty} item(s), but ${totalQty} provided`);
     }
 
+    // Check if slot has defined string items (e.g. combo meal deal with item names)
+    const slotItemNames = Array.isArray(slot.items)
+      ? slot.items.map((it) => (typeof it === 'object' && it !== null ? (it.name || it.title || '') : String(it)).trim().toLowerCase())
+      : [];
+
+    if (slotItemNames.length > 0) {
+      for (const it of slotItems) {
+        const itemName = String(it.name || it.title || it.product_id || '').trim().toLowerCase();
+        if (!itemName || !slotItemNames.includes(itemName)) {
+          throw badRequest(`Invalid selection "${it.name || ''}" for slot "${slotName}"`);
+        }
+      }
+    }
+
     if (!allowRepeats) {
       const seen = new Set();
       for (const it of slotItems) {
-        const pid = String(it.product_id);
+        const key = String(it.name || it.product_id);
         const qty = Number(it.quantity) || 1;
-        if (qty > 1 || seen.has(pid)) {
-          throw badRequest(`Slot "${slotName}" does not allow repeated items ("${pid}")`);
+        if (qty > 1 || seen.has(key)) {
+          throw badRequest(`Slot "${slotName}" does not allow repeated items ("${key}")`);
         }
-        seen.add(pid);
+        seen.add(key);
       }
     }
 
-    for (const it of slotItems) {
-      if (!it.product_id) throw badRequest(`product_id is required for slot "${slotName}"`);
-      const pid = String(it.product_id);
-      if (allowedProductIds && !allowedProductIds.includes(pid)) {
-        throw badRequest(`Product "${pid}" is not allowed for slot "${slotName}"`);
-      }
-      if (excludedProductIds.includes(pid)) {
-        throw badRequest(`Product "${pid}" is excluded from slot "${slotName}"`);
-      }
+    // Process product lookup if product_ids exist in slotItems
+    const pids = slotItems.map((it) => it.product_id ? String(it.product_id) : null).filter(Boolean);
+    let prodMap = new Map();
+    if (pids.length > 0) {
+      const { rows: prodRows } = await db.query(
+        'SELECT id, name, price, data FROM products WHERE restaurant_id = $1 AND id = ANY($2::text[]) AND status = true',
+        [restaurantId, pids]
+      );
+      prodMap = new Map(prodRows.map((p) => [String(p.id), p]));
     }
 
-    const pids = slotItems.map((it) => String(it.product_id));
-    const { rows: prodRows } = await db.query(
-      'SELECT id, name, price, data FROM products WHERE restaurant_id = $1 AND id = ANY($2::text[]) AND status = true',
-      [restaurantId, pids]
-    );
-    const prodMap = new Map(prodRows.map((p) => [String(p.id), p]));
-
     for (const it of slotItems) {
-      const pid = String(it.product_id);
       const qty = Math.max(1, parseInt(it.quantity || 1, 10));
-      const prod = prodMap.get(pid);
-      if (!prod) {
-        throw badRequest(`Product "${pid}" not found or inactive for restaurant`);
-      }
+      const pid = it.product_id ? String(it.product_id) : null;
+      const prod = pid ? prodMap.get(pid) : null;
+      const itemName = it.name || prod?.name || `Item`;
 
       let itemExtra = 0;
-
-      // Derive item-level surcharge strictly from trusted slot configuration, never client input
-      const slotItemCharges = (slot.item_extra_charges && typeof slot.item_extra_charges === 'object')
-        ? slot.item_extra_charges
-        : {};
-      const trustedItemCharge = Number(slotItemCharges[pid] || 0);
-      if (trustedItemCharge > 0) {
-        itemExtra += trustedItemCharge * qty;
+      if (pid) {
+        if (allowedProductIds && !allowedProductIds.includes(pid)) {
+          throw badRequest(`Product "${pid}" is not allowed for slot "${slotName}"`);
+        }
+        if (excludedProductIds.includes(pid)) {
+          throw badRequest(`Product "${pid}" is excluded from slot "${slotName}"`);
+        }
+        const slotItemCharges = (slot.item_extra_charges && typeof slot.item_extra_charges === 'object')
+          ? slot.item_extra_charges
+          : {};
+        const trustedItemCharge = Number(slotItemCharges[pid] || 0);
+        if (trustedItemCharge > 0) {
+          itemExtra += trustedItemCharge * qty;
+        }
       }
 
       const verifiedAddons = [];
@@ -165,19 +179,18 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
       lineItemDetails.push({
         slot_id: slotId,
         slot_name: slotName,
-        product_id: prod.id,
-        name: prod.name,
+        product_id: prod?.id || null,
+        name: itemName,
         quantity: qty,
         addons: verifiedAddons,
         extra_charge: Number(itemExtra.toFixed(2)),
       });
 
       summaryLines.push(
-        `${qty}x ${prod.name}${verifiedAddons.length ? ` (+${verifiedAddons.map((a) => a.name).join(', ')})` : ''}`
+        `${qty}x ${itemName}${verifiedAddons.length ? ` (+${verifiedAddons.map((a) => a.name).join(', ')})` : ''}`
       );
     }
 
-    // Add trusted slot-level base extra charge if configured
     if (slot.extra_charge && Number(slot.extra_charge) > 0) {
       extraCharges += Number(slot.extra_charge);
     }
@@ -193,16 +206,21 @@ async function calculateDealPreview(restaurantId, body, dbPool) {
 
   const finalExtra = Number(extraCharges.toFixed(2));
   const totalPrice = Number((basePrice + finalExtra).toFixed(2));
+  const savings = Math.max(0, Number((wasPrice - totalPrice).toFixed(2)));
 
   return {
     deal_id: deal.id,
     name: deal.name,
+    price: totalPrice,
+    was_price: wasPrice,
+    savings,
     base_price: basePrice,
     extra_charges: finalExtra,
     total_price: totalPrice,
     slots: verifiedSlots,
     items: lineItemDetails,
     summary: summaryLines,
+    selections: selectionList,
   };
 }
 

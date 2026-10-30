@@ -52,7 +52,7 @@ router.get('/reports/x', asyncHandler(async (req, res) => {
             COALESCE(SUM(discount),0)::float AS discounts,
             COALESCE(SUM(tip),0)::float AS tips
      FROM orders WHERE restaurant_id = $1 AND created_at BETWEEN $2 AND $3
-       AND status NOT IN ('canceled')`,
+       AND status NOT IN ('canceled', 'cancelled')`,
     [r, from, to],
   );
   const { rows: counters } = await pool.query('SELECT x_counter, z_counter, opening_float FROM report_counters WHERE restaurant_id = $1', [r]);
@@ -68,7 +68,7 @@ router.get('/reports/z', asyncHandler(async (req, res) => {
     `SELECT COUNT(*)::int AS orders, COALESCE(SUM(total),0)::float AS gross,
             COUNT(*) FILTER (WHERE payment_method = 'cash')::int AS cash_orders,
             COUNT(*) FILTER (WHERE payment_method IN ('card','stripe'))::int AS card_orders,
-            COUNT(*) FILTER (WHERE status = 'canceled')::int AS cancelled
+            COUNT(*) FILTER (WHERE status IN ('canceled', 'cancelled'))::int AS cancelled
      FROM orders WHERE restaurant_id = $1 AND created_at BETWEEN $2 AND $3`,
     [r, from, to],
   );
@@ -92,7 +92,7 @@ router.get('/reports/products', asyncHandler(async (req, res) => {
   const { from, to } = range(req);
   const { rows } = await pool.query(
     `SELECT items FROM orders WHERE restaurant_id = $1 AND created_at BETWEEN $2 AND $3
-       AND status NOT IN ('canceled')`,
+       AND status NOT IN ('canceled', 'cancelled')`,
     [r, from, to],
   );
   const counts = {};
@@ -119,7 +119,7 @@ router.get('/reports/sales', asyncHandler(async (req, res) => {
             COUNT(*)::int AS orders,
             COALESCE(SUM(total),0)::float AS revenue
      FROM orders WHERE restaurant_id = $1 AND created_at BETWEEN $2 AND $3
-       AND status NOT IN ('canceled')
+       AND status NOT IN ('canceled', 'cancelled')
      GROUP BY 1 ORDER BY 1`,
     [r, from, to],
   );

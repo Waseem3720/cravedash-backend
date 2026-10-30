@@ -679,6 +679,52 @@ mount('/approvals', 'approval_requests', { jsonColumns: ['payload'] });
 const deliverymenWorkflow = require('./deliverymen');
 router.use('/deliverymen', deliverymenWorkflow);
 router.use('/riders', deliverymenWorkflow);
+router.get('/riders', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { status, radius_miles, search, phone } = req.query;
+  const params = [r];
+  let where = 'restaurant_id = $1';
+  if (search) {
+    params.push(`%${search}%`);
+    where += ` AND (name ILIKE $${params.length} OR phone ILIKE $${params.length} OR email ILIKE $${params.length})`;
+  } else if (phone) {
+    params.push(phone);
+    where += ` AND phone = $${params.length}`;
+  }
+  const { rows } = await pool.query(`SELECT * FROM deliverymen WHERE ${where} ORDER BY id ASC`, params);
+  let riders = rows.map((dm) => {
+    const data = typeof dm.data === 'string' ? JSON.parse(dm.data) : (dm.data || {});
+    const isOnline = data.available !== false && data.vehicleAvailable !== false && (!dm.status || dm.status === 'active' || dm.status === 'approved');
+    return {
+      id: dm.id,
+      restaurant_id: dm.restaurant_id,
+      branch_id: dm.branch_id || null,
+      name: dm.name,
+      phone: dm.phone || '',
+      email: dm.email || '',
+      vehicle: dm.vehicle || 'bike',
+      reg: data.reg || data.vehicle_reg || '',
+      status: dm.status,
+      is_available: isOnline,
+      vehicleAvailable: isOnline,
+      available: isOnline,
+      zones: data.zones || [],
+      capacity: Number(data.capacity || 3),
+      avg_rating: Number(data.avg_rating || 5.0),
+      review_count: Number(data.review_count || 0),
+      data,
+    };
+  });
+  if (status && status !== 'all') {
+    if (status === 'available') {
+      riders = riders.filter((r) => r.is_available);
+    } else if (status === 'busy') {
+      riders = riders.filter((r) => !r.is_available);
+    }
+  }
+  ok(res, riders);
+}));
+
 mount('/deliverymen', 'deliverymen');
 mount('/riders', 'deliverymen');
 mount('/chefs', 'chefs');
@@ -1254,10 +1300,13 @@ router.get('/config/delivery-fee', asyncHandler(async (req, res) => {
     ).catch(() => ({ rows: [] }));
     branch = bRows[0];
   }
+  const { rows: restRows } = await pool.query('SELECT data FROM restaurants WHERE id = $1', [r]).catch(() => ({ rows: [] }));
+  const restData = restRows[0]?.data || {};
   const bData = branch?.data && typeof branch.data === 'object' ? branch.data : {};
   const fee = Number(branch?.delivery_fee != null ? branch.delivery_fee : (bData.delivery_fee != null ? bData.delivery_fee : 2.50));
   const minOrder = Number(branch?.min_order != null ? branch.min_order : (bData.min_order != null ? bData.min_order : 10.00));
-  const freeOver = Number(branch?.free_delivery_over_amount != null ? branch.free_delivery_over_amount : (bData.free_delivery_over_amount != null ? bData.free_delivery_over_amount : 0));
+  const defaultFreeOver = Number(restData.free_delivery_over || 20.00);
+  const freeOver = Number(branch?.free_delivery_over_amount != null ? branch.free_delivery_over_amount : (bData.free_delivery_over_amount != null ? bData.free_delivery_over_amount : defaultFreeOver));
   const freeStatus = branch?.free_delivery_over_status != null
     ? Number(branch.free_delivery_over_status)
     : (bData.free_delivery_over_status != null ? Number(bData.free_delivery_over_status) : (freeOver > 0 ? 1 : 0));
@@ -1338,6 +1387,8 @@ router.get('/config/check-postcode', asyncHandler(async (req, res) => {
     return ok(res, {
       deliverable: false,
       is_covered: false,
+      zone: null,
+      delivery_fee: null,
       postcode: rawPostcode.toUpperCase(),
       postcode_normalized: normalized,
       message: 'We do not deliver to this postcode',
@@ -1390,6 +1441,7 @@ router.get('/banners', asyncHandler(async (req, res) => {
       return {
         id: b.id || `banner_${idx + 1}`,
         title: b.title || '',
+        sub_title: b.sub_title || b.subtitle || '',
         image: img,
         image_full_url: fullUrl,
         link: b.link || b.link_url || '',
@@ -1494,6 +1546,20 @@ function customerId(req) {
   return String(id);
 }
 
+function deriveRoad(fullAddress, line1, city) {
+  if (!fullAddress || typeof fullAddress !== 'string') return line1 || '';
+  let str = fullAddress;
+  if (line1 && typeof line1 === 'string' && line1.trim()) {
+    str = str.replace(new RegExp(line1.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '');
+  }
+  if (city && typeof city === 'string' && city.trim()) {
+    str = str.replace(new RegExp(city.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '');
+  }
+  str = str.replace(/^[,\s]+|[,\s]+$/g, '').trim();
+  str = str.replace(/,\s*,/g, ',').trim();
+  return str || fullAddress;
+}
+
 router.get('/customer/info', asyncHandler(async (req, res) => {
   const custId = customerId(req);
   const r = rid(req);
@@ -1504,7 +1570,21 @@ router.get('/customer/info', asyncHandler(async (req, res) => {
     [custId, r],
   );
   if (!rows[0]) throw notFound('Customer profile not found');
-  ok(res, rows[0]);
+  const c = rows[0];
+  ok(res, {
+    user: {
+      id: c.id,
+      name: c.name || '',
+      f_name: c.f_name || c.name?.split(' ')[0] || '',
+      l_name: c.l_name || c.name?.split(' ').slice(1).join(' ') || '',
+      email: c.email || '',
+      phone: c.phone || '',
+      avatar_url: c.avatar_url || c.data?.avatar_url || '',
+    },
+    wallet_balance: Number(Number(c.wallet_balance || 0).toFixed(2)),
+    loyalty_points: Number(c.loyalty_points || 0),
+    status: c.status !== false,
+  });
 }));
 
 async function updateCustomerProfileHandler(req, res) {
@@ -1540,7 +1620,17 @@ async function updateCustomerProfileHandler(req, res) {
      RETURNING id, restaurant_id, name, f_name, l_name, email, phone, wallet_balance, loyalty_points, status, address, data, created_at, updated_at`,
     [custId, r, name, f_name, l_name, phone, address, passwordHash],
   );
-  ok(res, rows[0]);
+  const updated = rows[0];
+  ok(res, {
+    id: updated.id,
+    name: updated.name,
+    f_name: updated.f_name || updated.name?.split(' ')[0] || '',
+    l_name: updated.l_name || updated.name?.split(' ').slice(1).join(' ') || '',
+    email: updated.email,
+    phone: updated.phone,
+    wallet_balance: Number(Number(updated.wallet_balance || 0).toFixed(2)),
+    loyalty_points: Number(updated.loyalty_points || 0),
+  });
 }
 
 router.put('/customer/info', asyncHandler(updateCustomerProfileHandler));
@@ -1568,11 +1658,25 @@ router.get('/customer/address/list', asyncHandler(async (req, res) => {
      ORDER BY is_default DESC, id DESC`,
     [custId, r],
   );
-  const formatted = rows.map((a) => ({
-    ...a,
-    address_line_1: a.line1 || a.address,
-    address_line_2: a.line2 || '',
-  }));
+  const formatted = rows.map((a) => {
+    const line1 = a.line1 || a.address || '';
+    const line2 = a.line2 || '';
+    const road = deriveRoad(a.address, line1, a.city);
+    return {
+      id: a.id,
+      customer_id: a.customer_id,
+      address_type: a.address_type,
+      contact_person_name: a.contact_person_name,
+      contact_person_number: a.contact_person_number,
+      address: a.address,
+      address_line_1: line1,
+      address_line_2: line2,
+      road: road || a.address,
+      city: a.city,
+      postcode: a.postcode,
+      is_default: !!a.is_default,
+    };
+  });
   ok(res, formatted);
 }));
 
@@ -1596,7 +1700,7 @@ router.post('/customer/address/add', asyncHandler(async (req, res) => {
 
   if (isDefault) {
     await pool.query(
-      'UPDATE customer_addresses SET is_default = FALSE WHERE customer_id = $1 AND restaurant_id = $2',
+      'UPDATE customer_addresses SET is_default = FALSE WHERE customer_id = $1 AND (restaurant_id = $2 OR restaurant_id IS NULL)',
       [custId, r],
     );
   }
@@ -1614,9 +1718,14 @@ router.post('/customer/address/add', asyncHandler(async (req, res) => {
   created(res, {
     message: 'Address saved successfully',
     address_id: rows[0].id,
-    ...rows[0],
-    address_line_1: rows[0].line1,
-    address_line_2: rows[0].line2,
+    id: rows[0].id,
+    address_type: rows[0].address_type,
+    address: rows[0].address,
+    address_line_1: rows[0].line1 || rows[0].address,
+    address_line_2: rows[0].line2 || '',
+    city: rows[0].city,
+    postcode: rows[0].postcode,
+    is_default: !!rows[0].is_default,
   });
 }));
 
@@ -1666,9 +1775,14 @@ async function updateAddressHandler(req, res) {
   );
   ok(res, {
     message: 'Address updated successfully',
-    ...rows[0],
-    address_line_1: rows[0].line1,
-    address_line_2: rows[0].line2,
+    id: rows[0].id,
+    address_type: rows[0].address_type,
+    address: rows[0].address,
+    address_line_1: rows[0].line1 || rows[0].address,
+    address_line_2: rows[0].line2 || '',
+    city: rows[0].city,
+    postcode: rows[0].postcode,
+    is_default: !!rows[0].is_default,
   });
 }
 

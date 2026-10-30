@@ -1,0 +1,107 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Linux VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Populate known_hosts with the provided server host fingerprint (never disable verification)
+          echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+          # Install the deploy SSH private key (strip Windows CRLF if present)
+          echo "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy to Server via SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -p "${SERVER_PORT:-22}" \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes \
+              "${SERVER_USER}@${SERVER_HOST}" 'bash -s' << 'EOF'
+            set -euo pipefail
+
+            DEPLOY_DIR="/opt/cravedash-node"
+
+            echo "=========================================================="
+            echo "Starting CraveDash Deployment on $(hostname)"
+            echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "=========================================================="
+
+            # 1. Verify target directory
+            if [ ! -d "$DEPLOY_DIR" ]; then
+              echo "ERROR: Target directory '$DEPLOY_DIR' does not exist on the server."
+              exit 1
+            fi
+
+            cd "$DEPLOY_DIR"
+            echo "Navigated to: $(pwd)"
+
+            # 2. Verify production environment file
+            if [ ! -f .env ]; then
+              echo "ERROR: .env file is missing in $DEPLOY_DIR."
+              echo "Ensure .env is configured with production secrets before deploying."
+              exit 1
+            fi
+
+            # 3. Pull latest code from main branch
+            echo "--- 1. Pulling latest changes from main branch ---"
+            git fetch origin main
+            git checkout main
+            git pull origin main
+
+            # 4. Resolve Docker Compose command
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE_CMD="docker compose"
+            elif which docker-compose >/dev/null 2>&1; then
+              COMPOSE_CMD="docker-compose"
+            else
+              echo "ERROR: Neither 'docker compose' nor 'docker-compose' found on the server."
+              exit 1
+            fi
+
+            # 5. Build and launch production stack
+            echo "--- 2. Deploying stack with existing docker-compose.prod.yml ---"
+            $COMPOSE_CMD -f docker-compose.prod.yml up -d --build --remove-orphans
+
+            # 6. Verify container status
+            echo "--- 3. Verifying container status ---"
+            $COMPOSE_CMD -f docker-compose.prod.yml ps
+
+            # 7. Clean up dangling images to preserve disk space
+            echo "--- 4. Cleaning up dangling images ---"
+            docker image prune -f
+
+            echo "=========================================================="
+            echo "CraveDash Deployment completed successfully!"
+            echo "=========================================================="
+          EOF
+
+      - name: Cleanup SSH Keys
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+

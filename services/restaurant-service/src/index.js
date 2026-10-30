@@ -120,6 +120,10 @@ function restaurantAuth(req, res, next) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       return requireRole('super', 'restaurant', 'epos', 'rider', 'chef')(req, res, next);
     }
+    // Notifications mutations (read/mark-all-read) allowed for chef and kitchen staff
+    if (req.path.startsWith('/notifications') || req.originalUrl.includes('/notifications')) {
+      return requireRole('super', 'restaurant', 'epos', 'chef')(req, res, next);
+    }
     requireRole('super', 'restaurant', 'epos')(req, res, (roleErr) => {
       if (roleErr) return next(roleErr);
       eposReadOnly(req, res, next);

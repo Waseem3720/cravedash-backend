@@ -569,36 +569,6 @@ function assertTicketAccess(req, row) {
     if (req.user?.role !== 'super') body.status = body.status || 'open';
     created(res, await crud.create(body, null));
   }));
-  router.post('/support/contact', asyncHandler(async (req, res) => {
-    const forceRid = req.user?.restaurant_id || req.headers['x-restaurant-id'] || 'r1';
-    const body = req.body || {};
-    const ticketId = `TK-${Date.now().toString(36)}`;
-    const ticketRecord = {
-      id: ticketId,
-      restaurant_id: forceRid,
-      subject: `Kitchen Support Inquiry: ${body.message ? String(body.message).slice(0, 40) : 'Inquiry'}...`,
-      status: 'open',
-      priority: 'normal',
-      messages: [{
-        sender: body.email || 'Chef',
-        phone: body.phone ? `${body.country_code || ''}${body.phone}` : '',
-        body: body.message || 'Support inquiry from chef',
-        at: new Date().toISOString(),
-      }],
-      data: {
-        email: body.email,
-        phone: body.phone,
-        country_code: body.country_code,
-        source: 'chef_app',
-      },
-    };
-    await crud.create(ticketRecord, null);
-    created(res, {
-      ticket_id: ticketId,
-      message: 'Support inquiry submitted successfully',
-      created_at: new Date().toISOString(),
-    });
-  }));
   router.put('/support-tickets/:id', asyncHandler(async (req, res) => {
     const existing = assertTicketAccess(req, await crud.getById(req.params.id, null));
     const forceRid = req.user?.role === 'super' ? undefined : existing.restaurant_id;
@@ -626,6 +596,66 @@ function assertTicketAccess(req, row) {
     if (req.user?.role !== 'super') throw forbidden('Only platform admins can delete tickets');
     ok(res, await crud.remove(req.params.id, null));
   }));
+
+  const handleSupportContact = asyncHandler(async (req, res) => {
+    const { email, country_code, phone, message } = req.body || {};
+    if (!message) throw badRequest('message is required');
+    const id = `tkt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const fullPhone = `${country_code || ''}${phone || ''}`.trim();
+    const requester = email || fullPhone || req.user?.email || 'Kitchen Staff';
+    let rid = null;
+    try { rid = restaurantId(req); } catch { rid = req.body?.restaurant_id || null; }
+
+    const ticket = {
+      id,
+      restaurant_id: rid,
+      subject: 'Kitchen Support Inquiry',
+      body: String(message),
+      channel: 'kitchen_app',
+      requester,
+      status: 'open',
+      priority: 'normal',
+      messages: [{
+        from: requester,
+        at: new Date().toISOString(),
+        body: String(message),
+      }],
+      data: {
+        email: email || null,
+        phone: fullPhone || null,
+        country_code: country_code || null,
+        submitted_by_role: req.user?.role || 'public',
+      },
+    };
+
+    await pool.query(
+      `INSERT INTO support_tickets (id, restaurant_id, subject, body, channel, requester, status, priority, messages, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, NOW(), NOW())`,
+      [
+        ticket.id,
+        ticket.restaurant_id,
+        ticket.subject,
+        ticket.body,
+        ticket.channel,
+        ticket.requester,
+        ticket.status,
+        ticket.priority,
+        JSON.stringify(ticket.messages),
+        JSON.stringify(ticket.data),
+      ]
+    );
+
+    created(res, {
+      success: true,
+      ticket_id: id,
+      message: 'Support inquiry submitted successfully',
+      ticket,
+    });
+  });
+
+  router.post('/support/contact', handleSupportContact);
+  router.post('/support-tickets/contact', handleSupportContact);
+  router.handleSupportContact = handleSupportContact;
 })();
 
 // ---- Payouts (super only via platformGate) ----

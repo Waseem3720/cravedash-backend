@@ -49,8 +49,8 @@ async function applyOrderEngines(restaurantId, order, { prevPayment } = {}) {
 }
 
 const STATUSES = new Set([
-  'pending', 'confirmed', 'processing', 'cooking', 'ready_for_serve',
-  'out_for_delivery', 'delivered', 'completed', 'canceled', 'returned', 'failed_to_deliver',
+  'pending', 'confirmed', 'processing', 'cooking', 'ready_for_serve', 'picked_up',
+  'out_for_delivery', 'delivered', 'completed', 'canceled', 'cancelled', 'returned', 'failed_to_deliver', 'failed',
 ]);
 
 /** Payment / money fields — not client-writable by restaurant admin (EPOS till + super only). */
@@ -64,18 +64,38 @@ function canSetMoneyFields(req) {
 }
 
 const TRANSITIONS = {
-  pending: ['confirmed', 'canceled'],
-  confirmed: ['processing', 'cooking', 'ready_for_serve', 'canceled'],
-  processing: ['cooking', 'ready_for_serve', 'canceled'],
-  cooking: ['ready_for_serve', 'out_for_delivery', 'canceled'],
-  ready_for_serve: ['out_for_delivery', 'completed', 'canceled'],
-  out_for_delivery: ['delivered', 'failed_to_deliver', 'canceled'],
+  pending: ['confirmed', 'canceled', 'cancelled'],
+  confirmed: ['processing', 'cooking', 'ready_for_serve', 'canceled', 'cancelled'],
+  processing: ['cooking', 'ready_for_serve', 'canceled', 'cancelled'],
+  cooking: ['ready_for_serve', 'picked_up', 'out_for_delivery', 'canceled', 'cancelled'],
+  ready_for_serve: ['picked_up', 'out_for_delivery', 'completed', 'canceled', 'cancelled'],
+  picked_up: ['out_for_delivery', 'delivered', 'failed_to_deliver', 'failed', 'canceled', 'cancelled'],
+  out_for_delivery: ['delivered', 'failed_to_deliver', 'failed', 'canceled', 'cancelled'],
   delivered: ['returned', 'completed'],
   completed: ['returned'],
   canceled: [],
+  cancelled: [],
   returned: [],
-  failed_to_deliver: ['canceled'],
+  failed_to_deliver: ['returned', 'canceled', 'cancelled'],
+  failed: ['returned', 'canceled', 'cancelled'],
 };
+
+// Active SSE client connections per restaurant
+const sseClients = new Map();
+
+function broadcastOrderEvent(restaurantIdVal, event, data) {
+  if (!restaurantIdVal) return;
+  const clients = sseClients.get(String(restaurantIdVal));
+  if (!clients || !clients.size) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of Array.from(clients)) {
+    try {
+      client.write(payload);
+    } catch {
+      clients.delete(client);
+    }
+  }
+}
 
 function rid(req) {
   return restaurantId(req);
@@ -176,7 +196,7 @@ router.get('/', asyncHandler(async (req, res) => {
   // Never trust x-user-role header — JWT role only
   const isSuper = req.user?.role === 'super';
   const allRestaurants = isSuper && (req.query.all === '1' || req.query.scope === 'platform');
-  const { status, stage, source, from, to, limit = 100, page = 1, restaurant_id, alerts, delivery_man_id } = req.query;
+  const { status, stage, source, from, to, limit = 100, page, restaurant_id, alerts, delivery_man_id } = req.query;
   const params = [];
   const where = [];
   if (!allRestaurants) {
@@ -200,26 +220,25 @@ router.get('/', asyncHandler(async (req, res) => {
     } else if (stage === 'preparing') {
       where.push(`status IN ('cooking', 'processing')`);
     } else if (stage === 'ready') {
-      where.push(`status IN ('ready_for_serve', 'ready')`);
+      where.push(`status = 'ready_for_serve'`);
     } else {
       params.push(stage);
       where.push(`status = $${params.length}`);
     }
   } else if (status) {
-    params.push(status);
-    where.push(`status = $${params.length}`);
-  }
-  if (source) {
-    if (source === 'delivery') {
-      where.push(`order_type = 'delivery'`);
-    } else if (source === 'dineIn') {
-      where.push(`order_type = 'dine_in'`);
-    } else if (source === 'collection') {
-      where.push(`order_type IN ('takeaway', 'collection')`);
-    } else if (source === 'walkIn' || source === 'epos') {
-      where.push(`source = 'pos'`);
+    if (status === 'canceled' || status === 'cancelled') {
+      where.push(`status IN ('canceled', 'cancelled')`);
+    } else {
+      params.push(status);
+      where.push(`status = $${params.length}`);
     }
   }
+
+  if (source) {
+    params.push(source);
+    where.push(`(order_type = $${params.length} OR source = $${params.length})`);
+  }
+
   // Branch ACL: till-bound / branch-scoped sessions only see their branch
   const scopedBranch = branchId(req);
   if (scopedBranch) {
@@ -250,8 +269,18 @@ router.get('/', asyncHandler(async (req, res) => {
     params.push(to);
     where.push(`created_at <= $${params.length}`);
   }
-  params.push(Math.min(1000, +limit || 100));
-  const sql = `SELECT * FROM orders ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC LIMIT $${params.length}`;
+
+  const parsedLimit = Math.min(1000, Math.max(1, +limit || 100));
+  params.push(parsedLimit);
+  let paging = `LIMIT $${params.length}`;
+  if (page) {
+    const parsedPage = Math.max(1, parseInt(page, 10) || 1);
+    const offset = (parsedPage - 1) * parsedLimit;
+    params.push(offset);
+    paging += ` OFFSET $${params.length}`;
+  }
+
+  const sql = `SELECT * FROM orders ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC ${paging}`;
   const { rows } = await pool.query(sql, params);
   const parsed = rows.map(parseOrder);
   if (isRider) {
@@ -260,6 +289,7 @@ router.get('/', asyncHandler(async (req, res) => {
   ok(res, parsed);
 }));
 
+/** GET /api/v1/orders/history — completed and rejected order archive (registered before /:id) */
 router.get('/history', asyncHandler(async (req, res) => {
   const scoped = rid(req);
   if (!scoped) throw badRequest('restaurant_id required');
@@ -268,42 +298,63 @@ router.get('/history', asyncHandler(async (req, res) => {
   const where = ['restaurant_id = $1'];
 
   if (filter === 'completed') {
-    where.push("status IN ('delivered', 'completed')");
-  } else if (filter === 'rejected' || filter === 'canceled') {
-    where.push("status IN ('canceled', 'rejected')");
+    where.push(`status IN ('completed', 'delivered')`);
+  } else if (filter === 'rejected' || filter === 'cancelled' || filter === 'canceled') {
+    where.push(`status IN ('canceled', 'cancelled', 'failed', 'failed_to_deliver')`);
   } else {
-    where.push("status IN ('delivered', 'completed', 'canceled', 'rejected')");
+    where.push(`status IN ('completed', 'delivered', 'canceled', 'cancelled', 'failed', 'failed_to_deliver')`);
   }
 
   if (date) {
     params.push(date);
-    where.push(`created_at::date = $${params.length}`);
+    where.push(`DATE(created_at) = $${params.length}`);
   }
 
-  const offset = (Math.max(1, +page) - 1) * Math.min(200, +limit || 50);
-  params.push(Math.min(200, +limit || 50));
-  params.push(offset);
+  const parsedLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+  const parsedPage = Math.max(1, parseInt(page, 10) || 1);
+  const offset = (parsedPage - 1) * parsedLimit;
 
+  params.push(parsedLimit, offset);
   const sql = `SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
   const { rows } = await pool.query(sql, params);
   ok(res, rows.map(parseOrder));
 }));
 
+/** GET /api/v1/orders/live-stream — Real-time Server-Sent Events (SSE) kitchen stream (registered before /:id) */
 router.get('/live-stream', (req, res) => {
+  let restaurantIdVal = null;
+  try {
+    restaurantIdVal = rid(req);
+  } catch {
+    restaurantIdVal = req.headers['x-restaurant-id'] || req.query.restaurant_id || 'r1';
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.flushHeaders?.();
 
-  res.write(`event: connected\ndata: ${JSON.stringify({ status: 'streaming', connected_at: new Date().toISOString() })}\n\n`);
+  const rKey = String(restaurantIdVal);
+  if (!sseClients.has(rKey)) {
+    sseClients.set(rKey, new Set());
+  }
+  const set = sseClients.get(rKey);
+  set.add(res);
 
-  const timer = setInterval(() => {
-    res.write(`event: ping\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
+  res.write(`event: connected\ndata: ${JSON.stringify({ status: 'connected', timestamp: new Date().toISOString(), restaurant_id: rKey })}\n\n`);
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(':keep-alive\n\n');
+    } catch {
+      clearInterval(heartbeat);
+      set.delete(res);
+    }
   }, 15000);
 
   req.on('close', () => {
-    clearInterval(timer);
-    res.end();
+    clearInterval(heartbeat);
+    set.delete(res);
   });
 });
 
@@ -465,9 +516,6 @@ router.put('/:id', asyncHandler(async (req, res) => {
   const body = req.body || {};
 
   if (role === 'chef' || role === 'kitchen') {
-    if (body.delivery_man_id !== undefined && String(body.delivery_man_id) !== String(existing.delivery_man_id || '')) {
-      throw forbidden('Chefs cannot assign or reassign delivery personnel');
-    }
     if (body.customer !== undefined) {
       throw forbidden('Chefs cannot modify customer details');
     }
@@ -482,6 +530,7 @@ router.put('/:id', asyncHandler(async (req, res) => {
     }
   }
 
+  let assignStatusUpdate = null;
   if (body.delivery_man_id) {
     const { rows: dm } = await pool.query(
       'SELECT id FROM deliverymen WHERE id = $1 AND restaurant_id = $2',
@@ -489,6 +538,10 @@ router.put('/:id', asyncHandler(async (req, res) => {
     );
     if (!dm[0]) {
       throw badRequest(`Delivery man "${body.delivery_man_id}" does not exist for this restaurant`);
+    }
+    // Cross-app dispatch consistency: if order is ready_for_serve or cooking and not explicitly setting status, move to out_for_delivery
+    if (body.status === undefined && ['ready_for_serve', 'cooking', 'confirmed'].includes(existing.status)) {
+      assignStatusUpdate = 'out_for_delivery';
     }
   }
   if (body.branch_id) {
@@ -508,6 +561,13 @@ router.put('/:id', asyncHandler(async (req, res) => {
   ];
   const sets = [];
   const params = [req.params.id, rid(req)];
+  if (assignStatusUpdate) {
+    params.push(assignStatusUpdate);
+    sets.push(`status = $${params.length}`);
+    const history = appendHistory(existing, assignStatusUpdate, req.user?.name || 'Staff');
+    params.push(JSON.stringify(history));
+    sets.push(`history = $${params.length}`);
+  }
   fields.forEach((f) => {
     if (body[f] === undefined) return;
     if (!moneyOk && MONEY_FIELDS.has(f)) return;
@@ -527,6 +587,7 @@ router.put('/:id', asyncHandler(async (req, res) => {
   );
   const updated = parseOrder(rows[0]);
   await applyOrderEngines(rid(req), updated, { prevPayment: existing.payment_status });
+  broadcastOrderEvent(rid(req), 'order:updated', updated);
   ok(res, updated);
 }));
 
@@ -536,14 +597,14 @@ router.post('/:id/status', asyncHandler(async (req, res) => {
   const role = req.user?.role;
 
   if (role === 'chef' || role === 'kitchen') {
-    const CHEF_PERMITTED = new Set(['confirmed', 'processing', 'cooking', 'ready_for_serve', 'canceled']);
+    const CHEF_PERMITTED = new Set(['confirmed', 'processing', 'cooking', 'ready_for_serve', 'completed', 'canceled', 'cancelled']);
     if (!CHEF_PERMITTED.has(status)) {
       throw forbidden(`Chefs cannot transition orders to ${status}`);
     }
   }
 
   if (role === 'rider' || role === 'courier') {
-    const RIDER_PERMITTED = new Set(['out_for_delivery', 'delivered', 'failed_to_deliver']);
+    const RIDER_PERMITTED = new Set(['picked_up', 'out_for_delivery', 'delivered', 'failed_to_deliver', 'failed']);
     if (!RIDER_PERMITTED.has(status)) {
       throw forbidden(`Riders cannot transition orders to ${status}`);
     }
@@ -563,6 +624,7 @@ router.post('/:id/status', asyncHandler(async (req, res) => {
   );
   const updated = parseOrder(rows[0]);
   await applyOrderEngines(rid(req), updated, { prevPayment: order.payment_status });
+  broadcastOrderEvent(rid(req), 'order:status_changed', { id: updated.id, status: updated.status });
   ok(res, updated);
 }));
 
@@ -587,16 +649,24 @@ router.post('/:id/accept', asyncHandler(async (req, res) => {
   if (!order) throw notFound();
   if (order.status !== 'pending') throw badRequest('Only pending orders can be accepted');
   const prep = Number((req.body || {}).prep_time || (req.body || {}).cook_time_minutes) || 20;
-  const station = (req.body || {}).station || null;
-  const note = (req.body || {}).note || null;
+  const station = (req.body || {}).station || 'Kitchen Main';
+  const acceptNote = (req.body || {}).note || 'Accepted by kitchen staff';
   const history = appendHistory(order, 'confirmed', req.user?.name || 'Staff');
-  const data = { ...(order.data || {}), prep_time: prep, station, accept_note: note };
+  const data = {
+    ...(order.data || {}),
+    prep_time: prep,
+    cook_time_minutes: prep,
+    station,
+    accept_note: acceptNote,
+  };
   const { rows } = await pool.query(
     `UPDATE orders SET status = 'confirmed', acknowledged = TRUE, history = $3, data = $4::jsonb, updated_at = NOW()
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
     [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
   );
-  ok(res, parseOrder(rows[0]));
+  const updated = parseOrder(rows[0]);
+  broadcastOrderEvent(rid(req), 'order:accepted', updated);
+  ok(res, updated);
 }));
 
 router.post('/:id/reject', asyncHandler(async (req, res) => {
@@ -608,21 +678,34 @@ router.post('/:id/reject', asyncHandler(async (req, res) => {
   if (!['pending', 'confirmed'].includes(order.status)) {
     throw badRequest(`Cannot reject order in status ${order.status}`);
   }
-  const note = (req.body || {}).note || (req.body || {}).custom_note || (req.body || {}).reason || 'Rejected by restaurant';
-  const history = appendHistory(order, 'canceled', req.user?.name || 'Staff');
-  const data = { ...(order.data || {}), cancel_reason: note };
+  const note = (req.body || {}).note || (req.body || {}).reason || (req.body || {}).custom_note || 'Rejected by restaurant';
+  const history = appendHistory(order, 'cancelled', req.user?.name || 'Staff');
+  const data = {
+    ...(order.data || {}),
+    cancel_reason: note,
+    rejection_reason: (req.body || {}).reason || note,
+    custom_note: (req.body || {}).custom_note || '',
+    rejected_at: (req.body || {}).rejected_at || new Date().toISOString(),
+  };
   const { rows } = await pool.query(
-    `UPDATE orders SET status = 'canceled', acknowledged = TRUE, history = $3, note = $4, data = $5::jsonb, updated_at = NOW()
+    `UPDATE orders SET status = 'cancelled', acknowledged = TRUE, history = $3, note = $4, data = $5::jsonb, updated_at = NOW()
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
     [req.params.id, rid(req), JSON.stringify(history), note, JSON.stringify(data)],
   );
-  ok(res, parseOrder(rows[0]));
+  const updated = parseOrder(rows[0]);
+  broadcastOrderEvent(rid(req), 'order:rejected', updated);
+  ok(res, updated);
 }));
 
+/** POST /api/v1/orders/:id/ready — Mark preparing order ready at pass station */
 router.post('/:id/ready', asyncHandler(async (req, res) => {
+  const role = req.user?.role;
+  if (role === 'rider' || role === 'courier') {
+    throw forbidden('Riders cannot mark orders ready');
+  }
   const order = await fetchOrder(req.params.id, rid(req), req);
-  if (!order) throw notFound();
-  const passStation = req.body?.pass_station || 'Kitchen Pass';
+  if (!order) throw notFound('Order not found');
+  const passStation = req.body?.pass_station || 'Pass Station';
   const readyAt = req.body?.ready_at || new Date().toISOString();
   const history = appendHistory(order, 'ready_for_serve', req.user?.name || 'Chef');
   const data = { ...(order.data || {}), pass_station: passStation, ready_at: readyAt };
@@ -631,92 +714,193 @@ router.post('/:id/ready', asyncHandler(async (req, res) => {
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
     [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
   );
-  ok(res, parseOrder(rows[0]));
+  const updated = parseOrder(rows[0]);
+  broadcastOrderEvent(rid(req), 'order:ready', { id: updated.id, status: 'ready_for_serve', pass_station: passStation });
+  ok(res, updated);
 }));
 
+/** POST /api/v1/orders/:id/complete — Mark order complete / served */
 router.post('/:id/complete', asyncHandler(async (req, res) => {
+  const role = req.user?.role;
+  if (role === 'rider' || role === 'courier') {
+    throw forbidden('Riders cannot directly complete orders via kitchen complete endpoint');
+  }
   const order = await fetchOrder(req.params.id, rid(req), req);
-  if (!order) throw notFound();
+  if (!order) throw notFound('Order not found');
   const completedAt = req.body?.completed_at || new Date().toISOString();
-  const history = appendHistory(order, 'delivered', req.user?.name || 'Chef');
+  const serviceType = req.body?.service_type || order.order_type;
+  const tableNumber = req.body?.table_number || null;
+  const history = appendHistory(order, 'completed', req.user?.name || 'Staff');
   const data = {
     ...(order.data || {}),
     completed_at: completedAt,
-    service_type: req.body?.service_type,
-    table_number: req.body?.table_number,
+    service_type: serviceType,
+    table_number: tableNumber,
   };
   const { rows } = await pool.query(
-    `UPDATE orders SET status = 'delivered', history = $3, data = $4::jsonb, updated_at = NOW()
+    `UPDATE orders SET status = 'completed', history = $3, data = $4::jsonb, updated_at = NOW()
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
     [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
   );
-  ok(res, parseOrder(rows[0]));
+  const updated = parseOrder(rows[0]);
+  await applyOrderEngines(rid(req), updated, { prevPayment: order.payment_status });
+  broadcastOrderEvent(rid(req), 'order:complete', { id: updated.id, status: 'completed' });
+  ok(res, updated);
 }));
 
+/** POST /api/v1/orders/:id/print — ESC/POS kitchen thermal ticket print */
 router.post('/:id/print', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
-  if (!order) throw notFound();
-  const printerId = req.body?.printer_id || 'printer_thermal_main';
-  const copies = Number(req.body?.copies) || 1;
-  const printJobId = `pj_${Date.now().toString(36)}`;
-  ok(res, {
-    job_id: printJobId,
+  if (!order) throw notFound('Order not found');
+  const { copies = 1, type = 'kitchen_ticket', printer_id = 'printer_thermal_main' } = req.body || {};
+  const printJob = {
+    id: `pj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     order_id: String(order.id),
-    printer_id: printerId,
-    copies,
-    status: 'queued',
+    type,
+    copies: Number(copies) || 1,
+    printer_id,
     printed_at: new Date().toISOString(),
+    status: 'queued',
+  };
+  const printJobs = Array.isArray(order.data?.print_jobs) ? [...order.data.print_jobs, printJob] : [printJob];
+  const data = { ...(order.data || {}), print_jobs: printJobs };
+  await pool.query(
+    `UPDATE orders SET data = $3::jsonb, updated_at = NOW() WHERE id = $1 AND restaurant_id = $2`,
+    [req.params.id, rid(req), JSON.stringify(data)],
+  );
+  ok(res, {
+    success: true,
+    message: 'Print job dispatched successfully',
+    order_id: String(order.id),
+    copies: Number(copies) || 1,
+    type,
+    printer_id,
   });
 }));
 
+/** POST /api/v1/orders/:id/refund — Process full or partial refund & notify customer */
 router.post('/:id/refund', asyncHandler(async (req, res) => {
+  const role = req.user?.role;
+  if (!['super', 'restaurant', 'chef', 'kitchen'].includes(role)) {
+    throw forbidden('Insufficient permissions to issue refund');
+  }
   const order = await fetchOrder(req.params.id, rid(req), req);
-  if (!order) throw notFound();
-  const refundAmount = Number(req.body?.refund_amount) || Number(order.total) || 0;
-  const customerEmail = req.body?.customer_email || order.customer?.email || '';
-  const message = req.body?.message || `Refund of £${refundAmount.toFixed(2)} issued`;
-  const history = appendHistory(order, 'refunded', req.user?.name || 'Staff');
+  if (!order) throw notFound('Order not found');
+  const { customer_email, refund_amount, currency = 'GBP', message } = req.body || {};
+  const amount = Number(refund_amount != null ? refund_amount : order.total);
+  if (isNaN(amount) || amount <= 0) {
+    throw badRequest('Invalid refund_amount');
+  }
+
+  const refundRecord = {
+    refund_amount: amount,
+    currency,
+    customer_email: customer_email || order.customer?.email || '',
+    message: message || `Refund of ${currency} ${amount.toFixed(2)} processed for order #${order.id}`,
+    refunded_at: new Date().toISOString(),
+    refunded_by: req.user?.name || req.user?.sub || 'Staff',
+  };
+
+  const history = appendHistory(order, 'refunded', `Refund: ${currency} ${amount.toFixed(2)} (${req.user?.name || 'Staff'})`);
   const data = {
     ...(order.data || {}),
-    refund_amount: refundAmount,
-    refund_message: message,
-    refunded_at: new Date().toISOString(),
+    refund: refundRecord,
+    total_refunded: Math.round(((order.data?.total_refunded || 0) + amount) * 100) / 100,
   };
+
   const { rows } = await pool.query(
     `UPDATE orders SET payment_status = 'refunded', history = $3, data = $4::jsonb, updated_at = NOW()
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
     [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
   );
+
+  // Send email to customer if configured
+  const targetEmail = customer_email || order.customer?.email;
+  if (targetEmail) {
+    try {
+      const emailProvider = require('@cravedash/shared/src/providers/email');
+      const { loadIntegrations } = require('../../../restaurant-service/src/routes/integrations');
+      const keys = await loadIntegrations(rid(req));
+      if (keys && keys.smtp && keys.smtp.host) {
+        await emailProvider.send(keys.smtp, {
+          to: targetEmail,
+          subject: `Refund Processed for Order #${order.id}`,
+          text: refundRecord.message,
+        });
+      } else {
+        console.log(`[order-refund-email-dev] Refund notification to ${targetEmail}: ${refundRecord.message}`);
+      }
+    } catch (err) {
+      console.warn('[order-refund-email] Email dispatch notice:', err.message);
+    }
+  }
+
   ok(res, {
+    success: true,
     order_id: String(order.id),
-    refund_amount: refundAmount,
-    customer_email: customerEmail,
+    refund_amount: amount,
+    currency,
+    customer_email: targetEmail || '',
     status: 'refunded',
-    message,
-    order: parseOrder(rows[0]),
   });
 }));
 
+/** POST /api/v1/orders/:id/dispatch — Assign delivery driver and transition to out for delivery */
 router.post('/:id/dispatch', asyncHandler(async (req, res) => {
+  const role = req.user?.role;
+  if (role === 'rider' || role === 'courier') {
+    throw forbidden('Riders cannot dispatch orders');
+  }
   const order = await fetchOrder(req.params.id, rid(req), req);
-  if (!order) throw notFound();
-  const riderId = req.body?.rider_id;
-  const riderName = req.body?.rider_name || 'Rider';
-  const dispatchedAt = req.body?.dispatched_at || new Date().toISOString();
-  const history = appendHistory(order, 'out_for_delivery', req.user?.name || 'Chef');
-  const data = { ...(order.data || {}), rider_id: riderId, rider_name: riderName, dispatched_at: dispatchedAt };
-  const { rows } = await pool.query(
-    `UPDATE orders SET status = 'out_for_delivery', delivery_man_id = $3, history = $4, data = $5::jsonb, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
-    [req.params.id, rid(req), riderId || null, JSON.stringify(history), JSON.stringify(data)],
+  if (!order) throw notFound('Order not found');
+
+  const { rider_id, rider_name, dispatched_at } = req.body || {};
+  if (!rider_id) throw badRequest('rider_id is required');
+
+  const { rows: dmRows } = await pool.query(
+    `SELECT id, name, vehicle FROM deliverymen WHERE id = $1 AND restaurant_id = $2 LIMIT 1`,
+    [String(rider_id), rid(req)],
   );
-  ok(res, {
-    order_id: String(order.id),
+  const matchedRider = dmRows[0];
+  const finalRiderName = rider_name || matchedRider?.name || `Rider ${rider_id}`;
+  const finalDispatchedAt = dispatched_at || new Date().toISOString();
+
+  const history = appendHistory(
+    order,
+    'out_for_delivery',
+    `Dispatched to ${finalRiderName} by ${req.user?.name || 'Staff'}`
+  );
+
+  const data = {
+    ...(order.data || {}),
+    dispatched_at: finalDispatchedAt,
+    rider_name: finalRiderName,
+    rider_id: String(rider_id),
+  };
+
+  const { rows } = await pool.query(
+    `UPDATE orders
+     SET delivery_man_id = $3, status = 'out_for_delivery', history = $4, data = $5::jsonb, updated_at = NOW()
+     WHERE id = $1 AND restaurant_id = $2
+     RETURNING *`,
+    [req.params.id, rid(req), String(rider_id), JSON.stringify(history), JSON.stringify(data)],
+  );
+
+  const updated = parseOrder(rows[0]);
+  broadcastOrderEvent(rid(req), 'order:dispatched', {
+    id: updated.id,
+    delivery_man_id: String(rider_id),
+    rider_name: finalRiderName,
     status: 'out_for_delivery',
-    rider_id: riderId,
-    rider_name: riderName,
-    dispatched_at: dispatchedAt,
-    order: parseOrder(rows[0]),
+  });
+
+  ok(res, {
+    success: true,
+    order_id: String(order.id),
+    delivery_man_id: String(rider_id),
+    rider_name: finalRiderName,
+    status: 'out_for_delivery',
+    dispatched_at: finalDispatchedAt,
   });
 }));
 
@@ -1000,6 +1184,7 @@ router.post('/:id/item-unavailable', handleRemoveItems);
 router.applyOrderEngines = applyOrderEngines;
 router.parseOrder = parseOrder;
 router.projectRiderOrder = projectRiderOrder;
+router.broadcastOrderEvent = broadcastOrderEvent;
 
 module.exports = router;
 

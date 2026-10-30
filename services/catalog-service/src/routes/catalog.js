@@ -59,8 +59,29 @@ function parseProduct(row) {
     if (!p.variations && p.data.variations) p.variations = p.data.variations;
     if (!p.choice_options && p.data.choice_options) p.choice_options = p.data.choice_options;
     if (p.priority == null && p.data.priority != null) p.priority = p.data.priority;
+    if (p.veg == null && p.data.veg != null) p.veg = p.data.veg;
+    if (p.image == null && p.data.image != null) p.image = p.data.image;
+    if (p.description == null && p.data.description != null) p.description = p.data.description;
   }
-  if (p.price != null) p.price = Number(p.price);
+  if (p.price != null) p.price = Number(Number(p.price).toFixed(2));
+
+  // Format ID to number if possible (e.g. 'p173' -> 173)
+  const strId = String(p.id);
+  const strippedId = strId.startsWith('p') && /^\d+$/.test(strId.slice(1)) ? Number(strId.slice(1)) : (Number.isInteger(Number(p.id)) ? Number(p.id) : p.id);
+  p.id = strippedId;
+
+  // Format category_id to number if possible ('cat1' -> 1)
+  if (p.category_id != null) {
+    const strCat = String(p.category_id);
+    if (strCat.startsWith('cat') && /^\d+$/.test(strCat.slice(3))) {
+      p.category_id = Number(strCat.slice(3));
+    } else if (Number.isInteger(Number(p.category_id))) {
+      p.category_id = Number(p.category_id);
+    }
+  }
+
+  p.veg = !!p.veg;
+  if (!Array.isArray(p.addons)) p.addons = [];
   return p;
 }
 
@@ -72,9 +93,9 @@ router.get('/categories/products/:id', asyncHandler(async (req, res) => {
     `SELECT p.*, c.name AS category_name
      FROM products p
      LEFT JOIN categories c ON p.category_id = c.id AND c.restaurant_id = p.restaurant_id
-     WHERE p.restaurant_id = $1 AND (p.category_id = $2 OR p.sub_category_id = $2) AND p.status = true
+     WHERE p.restaurant_id = $1 AND (p.category_id = $2 OR p.category_id = ('cat' || $2) OR p.sub_category_id = $2) AND p.status = true
      ORDER BY COALESCE((p.data->>'priority')::int, 0) ASC, p.id ASC`,
-    [r, categoryId],
+    [r, String(categoryId)],
   );
   ok(res, rows.map(parseProduct));
 }));
@@ -87,21 +108,48 @@ router.get('/products/details/:id', asyncHandler(async (req, res) => {
     `SELECT p.*, c.name AS category_name
      FROM products p
      LEFT JOIN categories c ON p.category_id = c.id AND c.restaurant_id = p.restaurant_id
-     WHERE p.restaurant_id = $1 AND p.id = $2`,
-    [r, productId],
+     WHERE p.restaurant_id = $1 AND (p.id = $2 OR p.id = ('p' || $2) OR ('p' || p.id) = $2)`,
+    [r, String(productId)],
   );
   if (!rows[0]) throw notFound('Product not found');
   const product = parseProduct(rows[0]);
-  if (Array.isArray(product.addons) && product.addons.length) {
-    const addonIds = product.addons.map((a) => (typeof a === 'object' ? a.id : a)).filter(Boolean);
-    if (addonIds.length) {
-      const { rows: addonRows } = await pool.query(
-        'SELECT * FROM addons WHERE restaurant_id = $1 AND id = ANY($2::text[]) AND status = true',
-        [r, addonIds],
-      );
-      product.addon_details = addonRows;
+
+  const rawAddons = Array.isArray(product.addons) ? product.addons : [];
+  const addonIds = rawAddons.map((a) => (typeof a === 'object' && a !== null ? a.id : a)).filter(Boolean);
+  let addonRows = [];
+  if (addonIds.length) {
+    const { rows: aRows } = await pool.query(
+      'SELECT id, name, price, status FROM addons WHERE restaurant_id = $1 AND id = ANY($2::text[]) AND status = true',
+      [r, addonIds],
+    );
+    addonRows = aRows;
+  }
+  const addonMap = new Map(addonRows.map((a) => [a.id, a]));
+  const validAddons = [];
+  const validAddonDetails = [];
+  for (const id of addonIds) {
+    const a = addonMap.get(id);
+    if (a) {
+      const price = Number(Number(a.price || 0).toFixed(2));
+      validAddons.push(a.id);
+      validAddonDetails.push({
+        id: a.id,
+        name: a.name,
+        price,
+        status: a.status !== false,
+        required: false,
+        options: [
+          {
+            id: a.id,
+            name: a.name,
+            price,
+          },
+        ],
+      });
     }
   }
+  product.addons = validAddons;
+  product.addon_details = validAddonDetails;
   ok(res, product);
 }));
 
@@ -401,9 +449,61 @@ function handleBulkTemplate(req, res) {
   res.status(200).send(templateCsv);
 }
 
+function formatDeal(d, includeSlots = false) {
+  const data = d.data && typeof d.data === 'object' ? d.data : {};
+  let slots = d.slots;
+  if (typeof slots === 'string') {
+    try { slots = JSON.parse(slots); } catch { slots = []; }
+  }
+  if (!Array.isArray(slots)) slots = [];
+
+  const price = Number(Number(d.price || 0).toFixed(2));
+  const wasPrice = Number(Number(d.was_price != null ? d.was_price : (data.was_price != null ? data.was_price : price)).toFixed(2));
+  const description = d.description || data.description || '';
+  const badge = d.badge || data.badge || '';
+  const image = d.image || data.image || '';
+  let contents = d.contents || data.contents || [];
+  if (!Array.isArray(contents) || contents.length === 0) {
+    contents = [];
+    for (const s of slots) {
+      if (Array.isArray(s.items)) {
+        for (const it of s.items) {
+          const val = typeof it === 'object' ? (it.name || it.title || '') : String(it);
+          contents.push({ label: s.label?.replace(/^Choose \d+\s*/i, '') || s.id || 'Item', value: val });
+        }
+      }
+    }
+  }
+
+  const out = {
+    id: d.id,
+    name: d.name,
+    price,
+    was_price: wasPrice,
+    badge,
+    image,
+    description: description || '',
+  };
+  if (!includeSlots) {
+    out.contents = contents;
+  } else {
+    out.slots = slots.map((s) => ({
+      id: s.id,
+      label: s.label || s.name || '',
+      required: Number(s.required ?? s.quantity ?? 1),
+      items: Array.isArray(s.items) ? s.items.map((it) => (typeof it === 'object' ? (it.name || it.title || '') : String(it))) : [],
+    }));
+  }
+  return out;
+}
+
 async function handleDealPreview(req, res) {
   const result = await calculateDealPreview(rid(req), req.body || {});
-  ok(res, { success: true, deal_preview: result });
+  ok(res, {
+    deal_id: result.deal_id,
+    price: result.price,
+    savings: result.savings,
+  });
 }
 
 // Bulk product operations
@@ -420,25 +520,150 @@ router.get('/catalog/products/bulk-template', handleBulkTemplate);
 router.post('/deals/preview', asyncHandler(handleDealPreview));
 router.post('/orders/deal-preview', asyncHandler(handleDealPreview));
 
-mountResource('/categories', 'categories');
+router.get('/categories', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query(
+    'SELECT * FROM categories WHERE restaurant_id = $1 AND status = true ORDER BY COALESCE(priority, num, 0) ASC, id ASC',
+    [r],
+  );
+  const formatted = rows.map((c) => {
+    const rawNum = c.num ?? (c.id && c.id.startsWith('cat') ? Number(c.id.slice(3)) : Number(c.id));
+    return {
+      id: !isNaN(rawNum) && rawNum > 0 ? rawNum : c.id,
+      name: c.name,
+      status: c.status !== false,
+    };
+  });
+  ok(res, formatted);
+}));
+
+router.get('/categories/:id', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const catId = req.params.id;
+  const numId = parseInt(catId, 10);
+  const { rows } = await pool.query(
+    `SELECT * FROM categories
+     WHERE restaurant_id = $1 AND (id = $2 OR (num = $3 AND $3 > 0) OR id = ('cat' || $2))
+     LIMIT 1`,
+    [r, String(catId), isNaN(numId) ? -1 : numId],
+  );
+  if (!rows[0]) throw notFound('Category not found');
+  const c = rows[0];
+  const rawNum = c.num ?? (c.id && c.id.startsWith('cat') ? Number(c.id.slice(3)) : Number(c.id));
+  ok(res, {
+    id: !isNaN(rawNum) && rawNum > 0 ? rawNum : c.id,
+    name: c.name,
+    status: c.status !== false,
+  });
+}));
+
+router.get('/products', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query(
+    'SELECT * FROM products WHERE restaurant_id = $1 AND status = true ORDER BY id ASC',
+    [r],
+  );
+  ok(res, rows.map(parseProduct));
+}));
+
+router.get('/products/:id', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const pId = req.params.id;
+  const { rows } = await pool.query(
+    `SELECT * FROM products
+     WHERE restaurant_id = $1 AND (id = $2 OR id = ('p' || $2) OR ('p' || id) = $2)
+     LIMIT 1`,
+    [r, String(pId)],
+  );
+  if (!rows[0]) throw notFound('Product not found');
+  ok(res, parseProduct(rows[0]));
+}));
+
+router.get('/addons', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query(
+    'SELECT id, name, price, status FROM addons WHERE restaurant_id = $1 AND status = true ORDER BY id ASC',
+    [r],
+  );
+  const formatted = rows.map((a) => ({
+    id: a.id,
+    name: a.name,
+    price: Number(Number(a.price || 0).toFixed(2)),
+  }));
+  ok(res, formatted);
+}));
+
+router.get('/deals', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query(
+    'SELECT * FROM deals WHERE restaurant_id = $1 AND status = true ORDER BY id ASC',
+    [r],
+  );
+  ok(res, rows.map((d) => formatDeal(d, false)));
+}));
+
+router.get('/deals/:id', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const dealId = req.params.id;
+  const { rows } = await pool.query(
+    `SELECT * FROM deals
+     WHERE restaurant_id = $1 AND (id = $2 OR id = regexp_replace($2, '^deal[-_]', '')) AND status = true
+     LIMIT 1`,
+    [r, String(dealId)],
+  );
+  if (!rows[0]) throw notFound('Deal not found');
+  ok(res, formatDeal(rows[0], true));
+}));
+
 mountResource('/subcategories', 'subcategories');
+mountResource('/cuisines', 'cuisines', { jsonColumns: ['data'] });
+mountResource('/categories', 'categories');
 mountResource('/products', 'products', { jsonColumns: ['data'], parseRow: parseProduct });
 mountResource('/addons', 'addons', { jsonColumns: ['data'] });
-mountResource('/cuisines', 'cuisines', { jsonColumns: ['data'] });
 mountResource('/deals', 'deals', { jsonColumns: ['data', 'slots'] });
 
 router.get('/catalog', asyncHandler(async (req, res) => {
   const r = rid(req);
-  const [categories, subcategories, rawProducts, addons, cuisines, deals] = await Promise.all([
-    buildCrud(pool, 'categories', { restaurantColumn: 'restaurant_id' }).list(r),
-    buildCrud(pool, 'subcategories', { restaurantColumn: 'restaurant_id' }).list(r),
-    buildCrud(pool, 'products', { restaurantColumn: 'restaurant_id', jsonColumns: ['data'] }).list(r),
-    buildCrud(pool, 'addons', { restaurantColumn: 'restaurant_id' }).list(r),
-    buildCrud(pool, 'cuisines', { restaurantColumn: 'restaurant_id' }).list(r),
-    buildCrud(pool, 'deals', { restaurantColumn: 'restaurant_id', jsonColumns: ['slots'] }).list(r),
+  const [catRows, prodRows, addonRows, dealRows] = await Promise.all([
+    pool.query('SELECT * FROM categories WHERE restaurant_id = $1 AND status = true ORDER BY COALESCE(priority, num, 0) ASC, id ASC', [r]),
+    pool.query('SELECT * FROM products WHERE restaurant_id = $1 AND status = true ORDER BY id ASC', [r]),
+    pool.query('SELECT id, name, price, status FROM addons WHERE restaurant_id = $1 AND status = true ORDER BY id ASC', [r]),
+    pool.query('SELECT * FROM deals WHERE restaurant_id = $1 AND status = true ORDER BY id ASC', [r]),
   ]);
-  const products = rawProducts.map(parseProduct);
-  ok(res, { categories, subcategories, products, addons, cuisines, deals });
+
+  const categories = catRows.rows.map((c) => {
+    const rawNum = c.num ?? (c.id && c.id.startsWith('cat') ? Number(c.id.slice(3)) : Number(c.id));
+    return {
+      id: !isNaN(rawNum) && rawNum > 0 ? rawNum : c.id,
+      name: c.name,
+      image: c.image || '',
+    };
+  });
+
+  const products = prodRows.rows.map(parseProduct);
+
+  const deals = dealRows.rows.map((d) => {
+    const data = d.data && typeof d.data === 'object' ? d.data : {};
+    const price = Number(Number(d.price || 0).toFixed(2));
+    const wasPrice = Number(Number(d.was_price != null ? d.was_price : (data.was_price != null ? data.was_price : price)).toFixed(2));
+    return {
+      id: d.id,
+      name: d.name,
+      price,
+      was_price: wasPrice,
+      badge: d.badge || data.badge || '',
+      image: d.image || data.image || '',
+      slots: [],
+    };
+  });
+
+  const addons = addonRows.rows.map((a) => ({
+    id: a.id,
+    name: a.name,
+    price: Number(Number(a.price || 0).toFixed(2)),
+  }));
+
+  ok(res, { categories, products, deals, addons });
 }));
 
 module.exports = router;

@@ -3,7 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 const { createApp } = require('@cravedash/shared/src/createApp');
 const { listenHost } = require('@cravedash/shared/src/listenHost');
-const { requireAuth, requireRole } = require('@cravedash/shared/src/authMiddleware');
+const { requireAuth, requireRole, optionalAuth } = require('@cravedash/shared/src/authMiddleware');
 const { forbidden } = require('@cravedash/shared/src/errors');
 const platform = require('./routes/platform');
 const { stripeWebhookHandler } = require('./routes/stripeOps');
@@ -27,11 +27,7 @@ function platformGate(req, res, next) {
   const method = (req.method || 'GET').toUpperCase();
   const p = req.path || '';
 
-  if (p === '/support/contact' || p.startsWith('/support')) {
-    return next();
-  }
-
-  if (role === 'restaurant' || role === 'epos' || role === 'chef') {
+  if (role === 'restaurant' || role === 'epos') {
     if (/^\/plans(\/|$)/.test(p)) {
       if (method === 'GET') return next();
       return next(forbidden('Plans are read-only for restaurants'));
@@ -40,7 +36,7 @@ function platformGate(req, res, next) {
       if (method === 'GET') return next();
       return next(forbidden('Platform meta is read-only for restaurants'));
     }
-    if (/^\/support-tickets(\/|$)/.test(p) || /^\/support(\/|$)/.test(p) || /^\/refund-requests(\/|$)/.test(p)) {
+    if (/^\/support-tickets(\/|$)/.test(p) || /^\/refund-requests(\/|$)/.test(p)) {
       return next();
     }
     // Payout requests: restaurant can list own + create requested (scoped in handler)
@@ -64,6 +60,9 @@ function platformGate(req, res, next) {
 
 // Stripe webhook: no JWT; signature verified inside handler (rawBody via createApp)
 app.post('/api/v1/stripe/webhook', stripeWebhookHandler);
+
+// Public / Chef support inquiry contact endpoint
+app.post(['/api/v1/support/contact', '/api/v1/support-tickets/contact'], optionalAuth, platform.handleSupportContact);
 
 app.use('/api/v1', requireAuth, platformGate, platform);
 

@@ -164,10 +164,15 @@ function proxy(name, target, prefixes) {
           // Public request validated via X-API-KEY
           proxyReq.setHeader('x-restaurant-id', req.apiKeyRestaurantId);
         } else {
-          // For unauthenticated storefront requests (e.g. Site 1 Porto Piri Piri):
-          // allow client-specified X-Restaurant-Id or fallback to DEFAULT_RESTAURANT_ID (default 'r1')
-          const defaultRid = req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
-          proxyReq.setHeader('x-restaurant-id', defaultRid);
+          // Unauthenticated requests: do NOT trust caller-supplied x-restaurant-id header.
+          const p = (req.originalUrl || req.url || '').split('?')[0];
+          const isSite1CustomerRoute = /^\/api\/v1\/(auth\/(login|registration|register|otp|oauth|social|email-verification)|config|banners|catalog|categories|products|addons|deals|coupon\/(list|apply)|customer\/order\/(calculate|deal-preview|place|track))(\/|$)/.test(p);
+          const defaultRid = (isSite1CustomerRoute ? (process.env.DEFAULT_RESTAURANT_ID || 'r1') : process.env.DEFAULT_RESTAURANT_ID) || null;
+          if (defaultRid) {
+            proxyReq.setHeader('x-restaurant-id', defaultRid);
+          } else {
+            proxyReq.removeHeader('x-restaurant-id');
+          }
         }
       },
       error: (err, req, res) => {
@@ -203,10 +208,10 @@ app.get('/api/v1/system/status', (req, res) => {
   res.json({
     success: true,
     data: {
-      status: 'healthy',
+      status: 'online',
+      service: 'gateway',
       timestamp: new Date().toISOString(),
-      service: 'cravedash-gateway',
-      version: '2.0.0',
+      version: '1.0.0',
     },
   });
 });
@@ -248,7 +253,12 @@ app.use(proxy('catalog', targets.catalog, [
   '/api/v1/cuisines',
   '/api/v1/deals',
 ]));
-app.use(proxy('order', targets.order, ['/api/v1/orders', '/api/v1/customer/order', '/api/v1/rider']));
+app.use(proxy('order', targets.order, [
+  '/api/v1/orders',
+  '/api/v1/customer/order',
+  '/api/v1/rider',
+  '/api/v1/deliveryman',
+]));
 app.use(proxy('restaurant', targets.restaurant, [
   '/api/v1/restaurant',
   '/api/v1/customer',
@@ -280,8 +290,8 @@ app.use(proxy('restaurant', targets.restaurant, [
   '/api/v1/ops',
   '/api/v1/subscribers',
   '/api/v1/config',
-  '/api/v1/brand',
   '/api/v1/banners',
+  '/api/v1/brand',
 ]));
 app.use(proxy('epos', targets.epos, ['/api/v1/epos', '/api/v1/sync']));
 app.use(proxy('reporting', targets.reporting, ['/api/v1/reports', '/api/v1/dashboard']));
