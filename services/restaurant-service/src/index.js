@@ -68,7 +68,7 @@ app.post('/api/v1/engines/marketplaces/:source/webhook', optionalAuth, asyncHand
 }));
 
 /** Public storefront requests supported for config, banners, and coupon endpoints */
-const PUBLIC_PREFIXES = ['/config', '/banners', '/coupon'];
+const PUBLIC_PREFIXES = ['/config', '/banners', '/coupon', '/brand'];
 function restaurantAuth(req, res, next) {
   // Allow public storefront access to /subscribers/events and /deliverymen/requests via trusted API-key context
   const isSubscriberEvent = req.method === 'POST' && (
@@ -145,7 +145,7 @@ app.use('/api/v1', (req, res, next) => {
   if (isIntegration) {
     return requireAuth(req, res, (err) => {
       if (err) return next(err);
-      requireRole('super', 'restaurant', 'epos')(req, res, (roleErr) => {
+      requireRole('super', 'restaurant', 'epos', 'chef')(req, res, (roleErr) => {
         if (roleErr) return next(roleErr);
         eposReadOnly(req, res, () => integrations(req, res, next));
       });

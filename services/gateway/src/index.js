@@ -164,7 +164,10 @@ function proxy(name, target, prefixes) {
           // Public request validated via X-API-KEY
           proxyReq.setHeader('x-restaurant-id', req.apiKeyRestaurantId);
         } else {
-          proxyReq.removeHeader('x-restaurant-id');
+          // For unauthenticated storefront requests (e.g. Site 1 Porto Piri Piri):
+          // allow client-specified X-Restaurant-Id or fallback to DEFAULT_RESTAURANT_ID (default 'r1')
+          const defaultRid = req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
+          proxyReq.setHeader('x-restaurant-id', defaultRid);
         }
       },
       error: (err, req, res) => {
@@ -196,6 +199,17 @@ app.get('/health', (req, res) => {
   }
   res.json(body);
 });
+app.get('/api/v1/system/status', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      service: 'cravedash-gateway',
+      version: '2.0.0',
+    },
+  });
+});
 app.get('/', (req, res) => res.json({ service: 'cravedash-gateway', api: '/api/v1' }));
 
 if (process.env.GATEWAY_JWT_VERIFY === 'off') {
@@ -218,6 +232,7 @@ app.use(proxy('platform', targets.platform, [
   '/api/v1/admins',
   '/api/v1/stripe',
   '/api/v1/support-tickets',
+  '/api/v1/support',
   '/api/v1/payouts',
   '/api/v1/refund-requests',
   '/api/v1/audit-events',
@@ -248,6 +263,7 @@ app.use(proxy('restaurant', targets.restaurant, [
   '/api/v1/employees',
   '/api/v1/settings',
   '/api/v1/deliverymen',
+  '/api/v1/riders',
   '/api/v1/chefs',
   '/api/v1/blobs',
   '/api/v1/domain',
@@ -264,6 +280,7 @@ app.use(proxy('restaurant', targets.restaurant, [
   '/api/v1/ops',
   '/api/v1/subscribers',
   '/api/v1/config',
+  '/api/v1/brand',
   '/api/v1/banners',
 ]));
 app.use(proxy('epos', targets.epos, ['/api/v1/epos', '/api/v1/sync']));

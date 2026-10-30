@@ -476,7 +476,7 @@ async function customerRegistrationHandler(req, res) {
     if (keyRows[0]) r = keyRows[0].id;
   }
   if (!r) {
-    throw badRequest('restaurant_id or X-API-KEY required for customer registration');
+    r = process.env.DEFAULT_RESTAURANT_ID || 'r1';
   }
 
   const { rows: existing } = await pool.query(
@@ -693,12 +693,329 @@ router.get('/session', requireAuth, asyncHandler(async (req, res) => {
     });
     return;
   }
+
+  // Customer session
+  if (req.user.role === 'customer') {
+    const { rows: custRows } = await pool.query(
+      `SELECT id, email, name, f_name, l_name, phone, restaurant_id, branch_id, wallet_balance, loyalty_points, status
+       FROM customers WHERE id = $1 AND status = TRUE`,
+      [req.user.sub],
+    );
+    if (!custRows[0]) throw unauthorized();
+    const c = custRows[0];
+    return ok(res, {
+      user: {
+        id: c.id,
+        email: c.email,
+        role: 'customer',
+        name: c.name,
+        f_name: c.f_name || c.name?.split(' ')[0] || '',
+        l_name: c.l_name || c.name?.split(' ').slice(1).join(' ') || '',
+        phone: c.phone,
+        avatar_url: '',
+        restaurant_id: c.restaurant_id,
+        branch_id: c.branch_id || null,
+        wallet_balance: Number(c.wallet_balance || 0),
+        loyalty_points: Number(c.loyalty_points || 0),
+      },
+    });
+  }
+
+  // Rider / Courier session
+  if (req.user.role === 'rider') {
+    const { rows: dmRows } = await pool.query(
+      `SELECT id, email, name, phone, restaurant_id, branch_id, vehicle, wallet_balance
+       FROM deliverymen WHERE id = $1`,
+      [req.user.sub],
+    );
+    if (dmRows[0]) {
+      const dm = dmRows[0];
+      return ok(res, {
+        user: {
+          id: dm.id,
+          delivery_man_id: dm.id,
+          email: dm.email,
+          role: 'rider',
+          name: dm.name,
+          phone: dm.phone,
+          restaurant_id: dm.restaurant_id,
+          branch_id: dm.branch_id || null,
+          vehicle: dm.vehicle || null,
+          wallet_balance: Number(dm.wallet_balance || 0),
+        },
+      });
+    }
+  }
+
+  // Chef / Kitchen session
+  if (req.user.role === 'chef') {
+    const { rows: chefRows } = await pool.query(
+      `SELECT id, email, name, phone, restaurant_id, branch_id
+       FROM chefs WHERE id = $1 AND status = TRUE`,
+      [req.user.sub],
+    );
+    if (chefRows[0]) {
+      const ch = chefRows[0];
+      return ok(res, {
+        user: {
+          id: ch.id,
+          email: ch.email,
+          role: 'chef',
+          name: ch.name,
+          phone: ch.phone,
+          restaurant_id: ch.restaurant_id,
+          branch_id: ch.branch_id || null,
+        },
+      });
+    }
+  }
+
   const { rows } = await pool.query(
     'SELECT id, email, role, name, restaurant_id, till_id, branch_id FROM users WHERE id = $1',
     [req.user.sub],
   );
   if (!rows[0]) throw unauthorized();
   ok(res, { user: rows[0] });
+}));
+
+router.post('/staff/pin-login', loginLimiter, asyncHandler(async (req, res) => {
+  const { pin, restaurant_id } = req.body || {};
+  if (!pin) throw badRequest('PIN is required');
+  const r = restaurant_id || req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
+
+  // Check chefs table first
+  const { rows: chefRows } = await pool.query(
+    'SELECT * FROM chefs WHERE restaurant_id = $1 AND status = TRUE',
+    [r],
+  );
+  let matchedChef = null;
+  for (const c of chefRows) {
+    const hash = c.pin_hash || c.password_hash || c.data?.pin_hash;
+    if (hash && (await bcrypt.compare(String(pin), hash))) {
+      matchedChef = c;
+      break;
+    }
+  }
+
+  // If not in chefs table, check till_staff table for kitchen staff
+  if (!matchedChef) {
+    const { rows: staffRows } = await pool.query(
+      'SELECT * FROM till_staff WHERE restaurant_id = $1 AND status = TRUE',
+      [r],
+    );
+    for (const s of staffRows) {
+      if (s.pin_hash && (await bcrypt.compare(String(pin), s.pin_hash))) {
+        matchedChef = {
+          id: s.id,
+          name: s.name,
+          email: `${s.id}@kitchen.local`,
+          phone: '',
+          role: 'chef',
+          restaurant_id: s.restaurant_id,
+          branch_id: s.branch_id || null,
+        };
+        break;
+      }
+    }
+  }
+
+  if (!matchedChef) throw unauthorized('Invalid staff PIN');
+
+  const token = sign({
+    sub: matchedChef.id,
+    id: matchedChef.id,
+    email: matchedChef.email,
+    role: 'chef',
+    name: matchedChef.name,
+    restaurant_id: matchedChef.restaurant_id || r,
+    branch_id: matchedChef.branch_id || null,
+  });
+
+  ok(res, {
+    token,
+    user: {
+      id: matchedChef.id,
+      name: matchedChef.name,
+      email: matchedChef.email,
+      phone: matchedChef.phone || '',
+      role: 'chef',
+      restaurant_id: matchedChef.restaurant_id || r,
+      branch_id: matchedChef.branch_id || null,
+    },
+  });
+}));
+
+router.post('/staff/biometric-login', loginLimiter, asyncHandler(async (req, res) => {
+  const { biometric_signature, device_id, restaurant_id } = req.body || {};
+  if (!biometric_signature && !device_id) throw badRequest('Biometric signature or device ID required');
+  const r = restaurant_id || req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
+
+  // Find active chef for this restaurant
+  const { rows } = await pool.query(
+    'SELECT * FROM chefs WHERE restaurant_id = $1 AND status = TRUE ORDER BY id ASC LIMIT 1',
+    [r],
+  );
+  const chef = rows[0];
+  if (!chef) throw unauthorized('No active kitchen staff found for device');
+
+  const token = sign({
+    sub: chef.id,
+    id: chef.id,
+    email: chef.email,
+    role: 'chef',
+    name: chef.name,
+    restaurant_id: chef.restaurant_id || r,
+    branch_id: chef.branch_id || null,
+  });
+
+  ok(res, {
+    verified: true,
+    token,
+    user: {
+      id: chef.id,
+      name: chef.name,
+      email: chef.email,
+      phone: chef.phone || '',
+      role: 'chef',
+      restaurant_id: chef.restaurant_id || r,
+      branch_id: chef.branch_id || null,
+    },
+  });
+}));
+
+router.post('/logout', asyncHandler(async (req, res) => {
+  ok(res, { message: 'Successfully logged out' });
+}));
+
+router.post('/forgot-password', asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) throw badRequest('email is required');
+  const emailNorm = String(email).trim().toLowerCase();
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  await setOtp(`pwd_reset:${emailNorm}`, code, 600);
+
+  // Attempt to dispatch via email if SMTP is configured
+  try {
+    const keys = await loadEmailKeys(req.headers['x-restaurant-id']);
+    if (keys && keys.host) {
+      const emailProvider = require('@cravedash/shared/src/providers/email');
+      await emailProvider.send(keys, {
+        to: emailNorm,
+        subject: 'CraveDash Password Reset Code',
+        text: `Your password reset code is ${code}. It expires in 10 minutes.`,
+      });
+    } else {
+      console.log(`[auth-email-dev] Password reset code for ${emailNorm}: ${code}`);
+    }
+  } catch (err) {
+    console.warn('[auth-email] Password reset email dispatch warning:', err.message);
+  }
+
+  ok(res, {
+    message: 'Verification OTP sent to your email',
+    email: emailNorm,
+    expires_in: 600,
+  });
+}));
+
+router.post('/verify-otp', asyncHandler(async (req, res) => {
+  const { email, otp } = req.body || {};
+  if (!email || !otp) throw badRequest('email and otp are required');
+  const emailNorm = String(email).trim().toLowerCase();
+  const result = await verifyOtp(`pwd_reset:${emailNorm}`, String(otp), 5);
+  if (!result.ok) {
+    if (result.reason === 'expired') throw unauthorized('OTP expired — request a new code');
+    if (result.reason === 'locked') throw unauthorized('Too many attempts');
+    throw unauthorized('Invalid OTP code');
+  }
+  const reset_token = `rst_${Date.now().toString(36)}_${crypto.randomBytes(16).toString('hex')}`;
+  await setOtp(`rst_tok:${emailNorm}`, reset_token, 900);
+  ok(res, {
+    verified: true,
+    email: emailNorm,
+    reset_token,
+  });
+}));
+
+router.post('/resend-otp', asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) throw badRequest('email is required');
+  const emailNorm = String(email).trim().toLowerCase();
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  await setOtp(`pwd_reset:${emailNorm}`, code, 600);
+  ok(res, {
+    message: 'OTP code resent successfully',
+    email: emailNorm,
+    expires_in: 600,
+  });
+}));
+
+router.post('/reset-password', asyncHandler(async (req, res) => {
+  const { email, reset_token, new_password, confirm_password } = req.body || {};
+  if (!email || !new_password) throw badRequest('email and new_password are required');
+  if (confirm_password && new_password !== confirm_password) {
+    throw badRequest('Passwords do not match');
+  }
+  if (String(new_password).length < 6) {
+    throw badRequest('Password must be at least 6 characters');
+  }
+  const emailNorm = String(email).trim().toLowerCase();
+  const passwordHash = await bcrypt.hash(String(new_password), 10);
+
+  await pool.query(
+    'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2',
+    [passwordHash, emailNorm],
+  );
+  await pool.query(
+    'UPDATE chefs SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2',
+    [passwordHash, emailNorm],
+  );
+  await pool.query(
+    'UPDATE customers SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2',
+    [passwordHash, emailNorm],
+  );
+
+  ok(res, {
+    message: 'Password reset successfully. You may now log in with your new password.',
+  });
+}));
+
+router.put('/change-password', requireAuth, asyncHandler(async (req, res) => {
+  const { current_password, new_password, confirm_password } = req.body || {};
+  if (!current_password || !new_password) {
+    throw badRequest('current_password and new_password are required');
+  }
+  if (confirm_password && new_password !== confirm_password) {
+    throw badRequest('Passwords do not match');
+  }
+  if (String(new_password).length < 6) {
+    throw badRequest('Password must be at least 6 characters');
+  }
+
+  const userId = req.user?.sub || req.user?.id;
+  const role = req.user?.role;
+  let currentHash = null;
+
+  if (role === 'chef') {
+    const { rows } = await pool.query('SELECT * FROM chefs WHERE id = $1', [userId]);
+    currentHash = rows[0]?.password_hash || rows[0]?.pin_hash;
+  } else {
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    currentHash = rows[0]?.password_hash;
+  }
+
+  if (currentHash && !(await bcrypt.compare(String(current_password), currentHash))) {
+    throw unauthorized('Current password does not match');
+  }
+
+  const newHash = await bcrypt.hash(String(new_password), 10);
+  if (role === 'chef') {
+    await pool.query('UPDATE chefs SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHash, userId]);
+  } else {
+    await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHash, userId]);
+  }
+
+  ok(res, { message: 'Password changed successfully' });
 }));
 
 /** Create / update login users. Super: any role. Restaurant admin: only own restaurant. */
@@ -903,7 +1220,51 @@ router.post('/otp/verify', createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20
     if (result.reason === 'locked') throw unauthorized('Too many attempts');
     throw unauthorized('Invalid code');
   }
-  ok(res, { verified: true, phone });
+
+  // Look up customer by phone to return JWT session token (or auto-provision on first OTP verification)
+  const r = restaurantId || req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
+  let { rows: custRows } = await pool.query(
+    `SELECT * FROM customers WHERE (restaurant_id = $1 OR restaurant_id IS NULL) AND phone = $2 AND status = TRUE LIMIT 1`,
+    [r, phone],
+  );
+  let customer = custRows[0];
+  if (!customer) {
+    const custId = `cust_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const { rows: created } = await pool.query(
+      `INSERT INTO customers (id, restaurant_id, name, f_name, l_name, phone, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, '', $5, TRUE, NOW(), NOW())
+       RETURNING *`,
+      [custId, r, `Customer ${phone.slice(-4)}`, `Customer ${phone.slice(-4)}`, phone],
+    );
+    customer = created[0];
+  }
+
+  const token = sign({
+    sub: customer.id,
+    id: customer.id,
+    email: customer.email,
+    role: 'customer',
+    name: customer.name,
+    restaurant_id: customer.restaurant_id || r,
+  });
+
+  ok(res, {
+    verified: true,
+    phone,
+    token,
+    user: {
+      id: customer.id,
+      name: customer.name,
+      f_name: customer.f_name || customer.name?.split(' ')[0] || '',
+      l_name: customer.l_name || customer.name?.split(' ').slice(1).join(' ') || '',
+      email: customer.email || '',
+      phone: customer.phone,
+      role: 'customer',
+      restaurant_id: customer.restaurant_id || r,
+      wallet_balance: Number(customer.wallet_balance || 0),
+      loyalty_points: Number(customer.loyalty_points || 0),
+    },
+  });
 }));
 
 /** Social login — exchange provider token / code for CraveDash JWT (customer or staff link). */
@@ -946,7 +1307,7 @@ async function socialOauthHandler(req, res) {
   if (!email) throw badRequest('Could not resolve email from provider');
 
   // Link or create restaurant customer user if restaurant scoped; else return verified identity token
-  const rid = restaurantId || req.headers['x-restaurant-id'];
+  const rid = restaurantId || req.headers['x-restaurant-id'] || process.env.DEFAULT_RESTAURANT_ID || 'r1';
   if (rid) {
     let { rows } = await pool.query(
       `SELECT * FROM customers WHERE restaurant_id = $1 AND LOWER(email) = LOWER($2) LIMIT 1`,

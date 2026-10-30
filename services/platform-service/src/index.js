@@ -27,7 +27,11 @@ function platformGate(req, res, next) {
   const method = (req.method || 'GET').toUpperCase();
   const p = req.path || '';
 
-  if (role === 'restaurant' || role === 'epos') {
+  if (p === '/support/contact' || p.startsWith('/support')) {
+    return next();
+  }
+
+  if (role === 'restaurant' || role === 'epos' || role === 'chef') {
     if (/^\/plans(\/|$)/.test(p)) {
       if (method === 'GET') return next();
       return next(forbidden('Plans are read-only for restaurants'));
@@ -36,7 +40,7 @@ function platformGate(req, res, next) {
       if (method === 'GET') return next();
       return next(forbidden('Platform meta is read-only for restaurants'));
     }
-    if (/^\/support-tickets(\/|$)/.test(p) || /^\/refund-requests(\/|$)/.test(p)) {
+    if (/^\/support-tickets(\/|$)/.test(p) || /^\/support(\/|$)/.test(p) || /^\/refund-requests(\/|$)/.test(p)) {
       return next();
     }
     // Payout requests: restaurant can list own + create requested (scoped in handler)

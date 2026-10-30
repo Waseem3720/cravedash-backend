@@ -17,13 +17,14 @@ function mountResource(path, table, opts = {}) {
   const crud = buildCrud(pool, table, { restaurantColumn: 'restaurant_id', jsonColumns: opts.jsonColumns || ['data', 'slots'], ...opts });
 
   router.get(path, asyncHandler(async (req, res) => {
-    ok(res, await crud.list(rid(req)));
+    const rows = await crud.list(rid(req));
+    ok(res, opts.parseRow ? rows.map(opts.parseRow) : rows);
   }));
 
   router.get(`${path}/:id`, asyncHandler(async (req, res) => {
     const row = await crud.getById(req.params.id, rid(req));
     if (!row) throw notFound();
-    ok(res, row);
+    ok(res, opts.parseRow ? opts.parseRow(row) : row);
   }));
 
   router.post(path, asyncHandler(async (req, res) => {
@@ -50,7 +51,7 @@ function parseProduct(row) {
   const p = { ...row };
   ['data', 'variations', 'addons', 'attributes', 'choice_options'].forEach((k) => {
     if (typeof p[k] === 'string') {
-      try { p[k] = JSON.parse(p[k]); } catch {}
+      try { p[k] = JSON.parse(p[k]); } catch { }
     }
   });
   if (p.data && typeof p.data === 'object') {
@@ -421,14 +422,14 @@ router.post('/orders/deal-preview', asyncHandler(handleDealPreview));
 
 mountResource('/categories', 'categories');
 mountResource('/subcategories', 'subcategories');
-mountResource('/products', 'products', { jsonColumns: ['data'] });
+mountResource('/products', 'products', { jsonColumns: ['data'], parseRow: parseProduct });
 mountResource('/addons', 'addons', { jsonColumns: ['data'] });
 mountResource('/cuisines', 'cuisines', { jsonColumns: ['data'] });
 mountResource('/deals', 'deals', { jsonColumns: ['data', 'slots'] });
 
 router.get('/catalog', asyncHandler(async (req, res) => {
   const r = rid(req);
-  const [categories, subcategories, products, addons, cuisines, deals] = await Promise.all([
+  const [categories, subcategories, rawProducts, addons, cuisines, deals] = await Promise.all([
     buildCrud(pool, 'categories', { restaurantColumn: 'restaurant_id' }).list(r),
     buildCrud(pool, 'subcategories', { restaurantColumn: 'restaurant_id' }).list(r),
     buildCrud(pool, 'products', { restaurantColumn: 'restaurant_id', jsonColumns: ['data'] }).list(r),
@@ -436,6 +437,7 @@ router.get('/catalog', asyncHandler(async (req, res) => {
     buildCrud(pool, 'cuisines', { restaurantColumn: 'restaurant_id' }).list(r),
     buildCrud(pool, 'deals', { restaurantColumn: 'restaurant_id', jsonColumns: ['slots'] }).list(r),
   ]);
+  const products = rawProducts.map(parseProduct);
   ok(res, { categories, subcategories, products, addons, cuisines, deals });
 }));
 

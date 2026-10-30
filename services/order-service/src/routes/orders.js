@@ -176,7 +176,7 @@ router.get('/', asyncHandler(async (req, res) => {
   // Never trust x-user-role header — JWT role only
   const isSuper = req.user?.role === 'super';
   const allRestaurants = isSuper && (req.query.all === '1' || req.query.scope === 'platform');
-  const { status, from, to, limit = 100, restaurant_id, alerts, delivery_man_id } = req.query;
+  const { status, stage, source, from, to, limit = 100, page = 1, restaurant_id, alerts, delivery_man_id } = req.query;
   const params = [];
   const where = [];
   if (!allRestaurants) {
@@ -194,9 +194,31 @@ router.get('/', asyncHandler(async (req, res) => {
     where.push(`status = 'pending'`);
     where.push(`COALESCE(acknowledged, FALSE) = FALSE`);
     where.push(`alert_dismissed_at IS NULL`);
+  } else if (stage) {
+    if (stage === 'newOrder') {
+      where.push(`status IN ('pending', 'confirmed')`);
+    } else if (stage === 'preparing') {
+      where.push(`status IN ('cooking', 'processing')`);
+    } else if (stage === 'ready') {
+      where.push(`status IN ('ready_for_serve', 'ready')`);
+    } else {
+      params.push(stage);
+      where.push(`status = $${params.length}`);
+    }
   } else if (status) {
     params.push(status);
     where.push(`status = $${params.length}`);
+  }
+  if (source) {
+    if (source === 'delivery') {
+      where.push(`order_type = 'delivery'`);
+    } else if (source === 'dineIn') {
+      where.push(`order_type = 'dine_in'`);
+    } else if (source === 'collection') {
+      where.push(`order_type IN ('takeaway', 'collection')`);
+    } else if (source === 'walkIn' || source === 'epos') {
+      where.push(`source = 'pos'`);
+    }
   }
   // Branch ACL: till-bound / branch-scoped sessions only see their branch
   const scopedBranch = branchId(req);
@@ -237,6 +259,53 @@ router.get('/', asyncHandler(async (req, res) => {
   }
   ok(res, parsed);
 }));
+
+router.get('/history', asyncHandler(async (req, res) => {
+  const scoped = rid(req);
+  if (!scoped) throw badRequest('restaurant_id required');
+  const { filter, date, page = 1, limit = 50 } = req.query;
+  const params = [scoped];
+  const where = ['restaurant_id = $1'];
+
+  if (filter === 'completed') {
+    where.push("status IN ('delivered', 'completed')");
+  } else if (filter === 'rejected' || filter === 'canceled') {
+    where.push("status IN ('canceled', 'rejected')");
+  } else {
+    where.push("status IN ('delivered', 'completed', 'canceled', 'rejected')");
+  }
+
+  if (date) {
+    params.push(date);
+    where.push(`created_at::date = $${params.length}`);
+  }
+
+  const offset = (Math.max(1, +page) - 1) * Math.min(200, +limit || 50);
+  params.push(Math.min(200, +limit || 50));
+  params.push(offset);
+
+  const sql = `SELECT * FROM orders WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`;
+  const { rows } = await pool.query(sql, params);
+  ok(res, rows.map(parseOrder));
+}));
+
+router.get('/live-stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  res.write(`event: connected\ndata: ${JSON.stringify({ status: 'streaming', connected_at: new Date().toISOString() })}\n\n`);
+
+  const timer = setInterval(() => {
+    res.write(`event: ping\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(timer);
+    res.end();
+  });
+});
 
 router.get('/:id', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
@@ -517,9 +586,11 @@ router.post('/:id/accept', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
   if (!order) throw notFound();
   if (order.status !== 'pending') throw badRequest('Only pending orders can be accepted');
-  const prep = Number((req.body || {}).prep_time) || 20;
+  const prep = Number((req.body || {}).prep_time || (req.body || {}).cook_time_minutes) || 20;
+  const station = (req.body || {}).station || null;
+  const note = (req.body || {}).note || null;
   const history = appendHistory(order, 'confirmed', req.user?.name || 'Staff');
-  const data = { ...(order.data || {}), prep_time: prep };
+  const data = { ...(order.data || {}), prep_time: prep, station, accept_note: note };
   const { rows } = await pool.query(
     `UPDATE orders SET status = 'confirmed', acknowledged = TRUE, history = $3, data = $4::jsonb, updated_at = NOW()
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
@@ -537,7 +608,7 @@ router.post('/:id/reject', asyncHandler(async (req, res) => {
   if (!['pending', 'confirmed'].includes(order.status)) {
     throw badRequest(`Cannot reject order in status ${order.status}`);
   }
-  const note = (req.body || {}).note || 'Rejected by restaurant';
+  const note = (req.body || {}).note || (req.body || {}).custom_note || (req.body || {}).reason || 'Rejected by restaurant';
   const history = appendHistory(order, 'canceled', req.user?.name || 'Staff');
   const data = { ...(order.data || {}), cancel_reason: note };
   const { rows } = await pool.query(
@@ -546,6 +617,107 @@ router.post('/:id/reject', asyncHandler(async (req, res) => {
     [req.params.id, rid(req), JSON.stringify(history), note, JSON.stringify(data)],
   );
   ok(res, parseOrder(rows[0]));
+}));
+
+router.post('/:id/ready', asyncHandler(async (req, res) => {
+  const order = await fetchOrder(req.params.id, rid(req), req);
+  if (!order) throw notFound();
+  const passStation = req.body?.pass_station || 'Kitchen Pass';
+  const readyAt = req.body?.ready_at || new Date().toISOString();
+  const history = appendHistory(order, 'ready_for_serve', req.user?.name || 'Chef');
+  const data = { ...(order.data || {}), pass_station: passStation, ready_at: readyAt };
+  const { rows } = await pool.query(
+    `UPDATE orders SET status = 'ready_for_serve', history = $3, data = $4::jsonb, updated_at = NOW()
+     WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
+    [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
+  );
+  ok(res, parseOrder(rows[0]));
+}));
+
+router.post('/:id/complete', asyncHandler(async (req, res) => {
+  const order = await fetchOrder(req.params.id, rid(req), req);
+  if (!order) throw notFound();
+  const completedAt = req.body?.completed_at || new Date().toISOString();
+  const history = appendHistory(order, 'delivered', req.user?.name || 'Chef');
+  const data = {
+    ...(order.data || {}),
+    completed_at: completedAt,
+    service_type: req.body?.service_type,
+    table_number: req.body?.table_number,
+  };
+  const { rows } = await pool.query(
+    `UPDATE orders SET status = 'delivered', history = $3, data = $4::jsonb, updated_at = NOW()
+     WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
+    [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
+  );
+  ok(res, parseOrder(rows[0]));
+}));
+
+router.post('/:id/print', asyncHandler(async (req, res) => {
+  const order = await fetchOrder(req.params.id, rid(req), req);
+  if (!order) throw notFound();
+  const printerId = req.body?.printer_id || 'printer_thermal_main';
+  const copies = Number(req.body?.copies) || 1;
+  const printJobId = `pj_${Date.now().toString(36)}`;
+  ok(res, {
+    job_id: printJobId,
+    order_id: String(order.id),
+    printer_id: printerId,
+    copies,
+    status: 'queued',
+    printed_at: new Date().toISOString(),
+  });
+}));
+
+router.post('/:id/refund', asyncHandler(async (req, res) => {
+  const order = await fetchOrder(req.params.id, rid(req), req);
+  if (!order) throw notFound();
+  const refundAmount = Number(req.body?.refund_amount) || Number(order.total) || 0;
+  const customerEmail = req.body?.customer_email || order.customer?.email || '';
+  const message = req.body?.message || `Refund of £${refundAmount.toFixed(2)} issued`;
+  const history = appendHistory(order, 'refunded', req.user?.name || 'Staff');
+  const data = {
+    ...(order.data || {}),
+    refund_amount: refundAmount,
+    refund_message: message,
+    refunded_at: new Date().toISOString(),
+  };
+  const { rows } = await pool.query(
+    `UPDATE orders SET payment_status = 'refunded', history = $3, data = $4::jsonb, updated_at = NOW()
+     WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
+    [req.params.id, rid(req), JSON.stringify(history), JSON.stringify(data)],
+  );
+  ok(res, {
+    order_id: String(order.id),
+    refund_amount: refundAmount,
+    customer_email: customerEmail,
+    status: 'refunded',
+    message,
+    order: parseOrder(rows[0]),
+  });
+}));
+
+router.post('/:id/dispatch', asyncHandler(async (req, res) => {
+  const order = await fetchOrder(req.params.id, rid(req), req);
+  if (!order) throw notFound();
+  const riderId = req.body?.rider_id;
+  const riderName = req.body?.rider_name || 'Rider';
+  const dispatchedAt = req.body?.dispatched_at || new Date().toISOString();
+  const history = appendHistory(order, 'out_for_delivery', req.user?.name || 'Chef');
+  const data = { ...(order.data || {}), rider_id: riderId, rider_name: riderName, dispatched_at: dispatchedAt };
+  const { rows } = await pool.query(
+    `UPDATE orders SET status = 'out_for_delivery', delivery_man_id = $3, history = $4, data = $5::jsonb, updated_at = NOW()
+     WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
+    [req.params.id, rid(req), riderId || null, JSON.stringify(history), JSON.stringify(data)],
+  );
+  ok(res, {
+    order_id: String(order.id),
+    status: 'out_for_delivery',
+    rider_id: riderId,
+    rider_name: riderName,
+    dispatched_at: dispatchedAt,
+    order: parseOrder(rows[0]),
+  });
 }));
 
 /** Cashier partial or full line item returns with authoritative refund calculation */

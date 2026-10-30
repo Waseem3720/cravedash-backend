@@ -62,22 +62,42 @@ function mount(path, table, opts = {}) {
   router.get(path, asyncHandler(async (req, res) => {
     const r = rid(req);
     const bound = opts.branchScope ? branchId(req) : null;
-    if (!bound) return ok(res, await crud.list(r));
+    const query = { ...req.query };
+    if (query.search) {
+      const term = `%${query.search}%`;
+      const { rows } = await pool.query(
+        `SELECT * FROM ${table} WHERE restaurant_id = $1 AND (name ILIKE $2 OR phone ILIKE $2 OR email ILIKE $2) ORDER BY id ASC`,
+        [r, term],
+      );
+      return ok(res, opts.parseRow ? rows.map(opts.parseRow) : rows);
+    }
+    if (query.phone) {
+      const { rows } = await pool.query(
+        `SELECT * FROM ${table} WHERE restaurant_id = $1 AND phone = $2 ORDER BY id ASC`,
+        [r, query.phone],
+      );
+      return ok(res, opts.parseRow ? rows.map(opts.parseRow) : rows);
+    }
+    if (!bound) {
+      const rows = await crud.list(r, query);
+      return ok(res, opts.parseRow ? rows.map(opts.parseRow) : rows);
+    }
     // Phase C.1: branch JWT sees own branch + HQ-shared (null branch_id)
     const { rows } = await pool.query(
       `SELECT * FROM ${table} WHERE restaurant_id = $1 AND (branch_id IS NULL OR branch_id = $2) ORDER BY id ASC`,
       [r, bound],
     );
-    ok(res, rows);
+    ok(res, opts.parseRow ? rows.map(opts.parseRow) : rows);
   }));
   router.get(`${path}/:id`, asyncHandler(async (req, res) => {
     const row = await crud.getById(req.params.id, rid(req));
     if (!row) throw notFound();
     if (opts.branchScope) assertBranchAccess(req, row.branch_id, { allowShared: true });
-    ok(res, row);
+    ok(res, opts.parseRow ? opts.parseRow(row) : row);
   }));
   router.post(path, asyncHandler(async (req, res) => {
-    const body = { ...req.body };
+    let body = { ...req.body };
+    if (opts.transformBody) body = opts.transformBody(body);
     if (!body.id) body.id = `${table.slice(0, 4)}_${Date.now().toString(36)}`;
     if (opts.branchScope) {
       const bound = branchId(req);
@@ -87,23 +107,28 @@ function mount(path, table, opts = {}) {
         assertBranchAccess(req, body.branch_id, { allowShared: true });
       }
     }
-    created(res, await crud.create(body, rid(req)));
+    const createdRow = await crud.create(body, rid(req));
+    created(res, opts.parseRow ? opts.parseRow(createdRow) : createdRow);
   }));
   router.put(`${path}/:id`, asyncHandler(async (req, res) => {
     const existing = await crud.getById(req.params.id, rid(req));
     if (!existing) throw notFound();
     if (opts.branchScope) assertBranchAccess(req, existing.branch_id, { allowShared: true });
-    const body = { ...req.body };
+    let body = { ...req.body };
+    if (opts.transformBody) body = opts.transformBody(body, existing);
     if (opts.branchScope && branchId(req)) delete body.branch_id; // cannot reassign out of scope
-    ok(res, await crud.update(req.params.id, body, rid(req)));
+    const updatedRow = await crud.update(req.params.id, body, rid(req));
+    ok(res, opts.parseRow ? opts.parseRow(updatedRow) : updatedRow);
   }));
   router.patch(`${path}/:id`, asyncHandler(async (req, res) => {
     const existing = await crud.getById(req.params.id, rid(req));
     if (!existing) throw notFound();
     if (opts.branchScope) assertBranchAccess(req, existing.branch_id, { allowShared: true });
-    const body = { ...req.body };
+    let body = { ...req.body };
+    if (opts.transformBody) body = opts.transformBody(body, existing);
     if (opts.branchScope && branchId(req)) delete body.branch_id;
-    ok(res, await crud.update(req.params.id, body, rid(req)));
+    const updatedRow = await crud.update(req.params.id, body, rid(req));
+    ok(res, opts.parseRow ? opts.parseRow(updatedRow) : updatedRow);
   }));
   router.delete(`${path}/:id`, asyncHandler(async (req, res) => {
     const existing = await crud.getById(req.params.id, rid(req));
@@ -120,13 +145,27 @@ mount('/customers', 'customers', {
     'id', 'name', 'email', 'phone', 'status', 'data',
     'f_name', 'l_name', 'address', 'branch', 'branch_id',
   ],
+  transformBody: (b, existing) => {
+    const existingData = (existing && existing.data && typeof existing.data === 'object') ? existing.data : {};
+    const data = { ...existingData, ...(b.data || {}) };
+    if (b.notes !== undefined) data.notes = b.notes;
+    if (b.postcode !== undefined) data.postcode = b.postcode;
+    if (b.rating !== undefined) data.rating = b.rating;
+    if (b.review_note !== undefined) data.review_note = b.review_note;
+    if (b.stars !== undefined) data.stars = b.stars;
+    return { ...b, data };
+  },
   parseRow: (r) => {
-    if (r && r.data && typeof r.data === 'object') {
-      if (r.data.rating !== undefined && r.rating === undefined) r.rating = r.data.rating;
-      if (r.data.stars !== undefined && r.stars === undefined) r.stars = r.data.stars;
-      if (r.data.review_note !== undefined && r.review_note === undefined) r.review_note = r.data.review_note;
+    if (!r) return r;
+    const row = { ...r };
+    if (row.data && typeof row.data === 'object') {
+      if (row.data.rating !== undefined && row.rating === undefined) row.rating = row.data.rating;
+      if (row.data.stars !== undefined && row.stars === undefined) row.stars = row.data.stars;
+      if (row.data.review_note !== undefined && row.review_note === undefined) row.review_note = row.data.review_note;
+      if (row.data.notes !== undefined && row.notes === undefined) row.notes = row.data.notes;
+      if (row.data.postcode !== undefined && row.postcode === undefined) row.postcode = row.data.postcode;
     }
-    return r;
+    return row;
   },
 });
 
@@ -639,7 +678,9 @@ router.delete('/bookings/:id', asyncHandler(async (req, res) => {
 mount('/approvals', 'approval_requests', { jsonColumns: ['payload'] });
 const deliverymenWorkflow = require('./deliverymen');
 router.use('/deliverymen', deliverymenWorkflow);
+router.use('/riders', deliverymenWorkflow);
 mount('/deliverymen', 'deliverymen');
+mount('/riders', 'deliverymen');
 mount('/chefs', 'chefs');
 
 router.get('/tables', asyncHandler(async (req, res) => {
@@ -761,6 +802,130 @@ router.get('/restaurant', asyncHandler(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM restaurants WHERE id = $1', [r]);
   if (!rows[0]) throw notFound('Restaurant not found');
   ok(res, rows[0]);
+}));
+
+router.get('/restaurant/profile', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query('SELECT * FROM restaurants WHERE id = $1', [r]);
+  if (!rows[0]) throw notFound('Restaurant not found');
+  ok(res, rows[0]);
+}));
+
+router.get('/restaurant/integrations', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [rid(req), 'integrations'],
+  );
+  const data = rows[0]?.data || {};
+  ok(res, {
+    epos: { connected: true, status: 'online' },
+    printers: { connected: true, status: 'online' },
+    tables: { connected: true, status: 'online' },
+    caller_id: { connected: true, status: 'active' },
+    integrations: data,
+  });
+}));
+
+router.get('/brand/config', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query('SELECT * FROM restaurants WHERE id = $1', [r]);
+  const rest = rows[0] || {};
+  const data = rest.data || {};
+  ok(res, {
+    brand_name: rest.name || 'Porto Piri Piri',
+    theme: {
+      primary_color: data.website_primary_color || data.primary_color || '#ff6b00',
+      logo_url: data.logo || 'https://img.cravedash.com/logo.png',
+      light_logo: data.light_logo || data.logo,
+      dark_logo: data.dark_logo || data.logo,
+      fav_icon: data.fav_icon || data.logo,
+      currency: data.currency || 'GBP',
+      currency_symbol: data.currency_symbol || '£',
+    },
+    order_settings: data.order_settings || { delivery: true, takeaway: true, dine_in: true },
+  });
+}));
+
+router.get('/notifications', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { unread_only, limit = 20, page = 1 } = req.query;
+
+  const { rows: blobRows } = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [r, 'notifications_feed'],
+  );
+  let notifications = Array.isArray(blobRows[0]?.data) ? blobRows[0].data : [];
+
+  if (!notifications.length) {
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, order_type, status, total, created_at, customer
+       FROM orders
+       WHERE restaurant_id = $1 AND status IN ('pending', 'confirmed', 'cooking')
+       ORDER BY created_at DESC LIMIT 10`,
+      [r],
+    );
+    notifications = orderRows.map((o) => ({
+      id: `notif_${o.id}`,
+      title: `New ${o.order_type || 'Takeaway'} Order #${o.id}`,
+      message: `Order #${o.id} for £${Number(o.total).toFixed(2)} received in kitchen`,
+      order_id: String(o.id),
+      is_read: false,
+      created_at: o.created_at,
+    }));
+  }
+
+  if (unread_only === 'true' || unread_only === true || unread_only === '1') {
+    notifications = notifications.filter((n) => !n.is_read);
+  }
+
+  const offset = (Math.max(1, +page) - 1) * Math.min(100, +limit || 20);
+  const paginated = notifications.slice(offset, offset + Math.min(100, +limit || 20));
+  ok(res, paginated);
+}));
+
+router.patch('/notifications/:id/read', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const notifId = req.params.id;
+  const { rows } = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [r, 'notifications_feed'],
+  );
+  let list = Array.isArray(rows[0]?.data) ? rows[0].data : [];
+  let found = false;
+  list = list.map((n) => {
+    if (String(n.id) === String(notifId)) {
+      found = true;
+      return { ...n, is_read: req.body?.is_read !== false };
+    }
+    return n;
+  });
+  if (!found) {
+    list.push({ id: notifId, is_read: true, updated_at: new Date().toISOString() });
+  }
+  await pool.query(
+    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
+     VALUES ($1, 'notifications_feed', $2::jsonb, NOW())
+     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+    [r, JSON.stringify(list)],
+  );
+  ok(res, { id: notifId, is_read: true, message: 'Notification marked as read' });
+}));
+
+router.post('/notifications/mark-all-read', asyncHandler(async (req, res) => {
+  const r = rid(req);
+  const { rows } = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [r, 'notifications_feed'],
+  );
+  let list = Array.isArray(rows[0]?.data) ? rows[0].data : [];
+  list = list.map((n) => ({ ...n, is_read: true }));
+  await pool.query(
+    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
+     VALUES ($1, 'notifications_feed', $2::jsonb, NOW())
+     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+    [r, JSON.stringify(list)],
+  );
+  ok(res, { success: true, message: 'All notifications marked as read' });
 }));
 
 /**
@@ -1025,11 +1190,17 @@ router.get('/config', asyncHandler(async (req, res) => {
   const currencySymbol = restData.currency_symbol || settings.currency_symbol || (currencyCode === 'USD' ? '$' : '£');
   const logo = restData.logo || 'default-logo.png';
 
+  const deliveryChargeVal = Number(restData.delivery_charge || settings.delivery_charge || 2.50);
+  const minOrderVal = Number(restData.min_order || settings.min_order || 10.00);
+
   const config = {
     restaurant_id: rest.id,
     restaurant_name: rest.name,
+    name: rest.name,
     restaurant_phone: rest.phone || '',
+    phone: rest.phone || '',
     restaurant_email: rest.email || '',
+    email: rest.email || '',
     restaurant_address: rest.address || '',
     restaurant_logo: logo,
     restaurant_light_logo: restData.light_logo || logo,
@@ -1038,8 +1209,17 @@ router.get('/config', asyncHandler(async (req, res) => {
     website_primary_color: restData.website_primary_color || restData.primary_color || '#ff6b00',
     currency_symbol: currencySymbol,
     currency_code: currencyCode,
+    currency: currencyCode,
     currency_position: restData.currency_position || settings.currency_position || 'left',
     currency_model: restData.currency_model || 'multi_currency',
+    ordering: {
+      delivery_charge: deliveryChargeVal,
+      free_delivery_over: Number(restData.free_delivery_over || settings.free_delivery_over || 20.00),
+      minimum_order: minOrderVal,
+      service_fee: Number(restData.service_fee || settings.service_fee || 0.50),
+      bag_charge: Number(restData.bag_charge || settings.bag_charge || 0.20),
+    },
+    payment_methods: restData.payment_methods || ['cash', 'card'],
     base_urls: {
       restaurant_image_url: `${baseUrl}/uploads/restaurant`,
       restaurant_cover_photo_url: `${baseUrl}/uploads/restaurant/cover`,
@@ -1057,8 +1237,8 @@ router.get('/config', asyncHandler(async (req, res) => {
       ...(settings.order_settings || {}),
     },
     restaurant_schedule_time: restData.schedule || settings.schedule || [],
-    delivery_charge: Number(restData.delivery_charge || settings.delivery_charge || 2.50),
-    min_order: Number(restData.min_order || settings.min_order || 10.00),
+    delivery_charge: deliveryChargeVal,
+    min_order: minOrderVal,
   };
   ok(res, config);
 }));
@@ -1082,8 +1262,14 @@ router.get('/config/delivery-fee', asyncHandler(async (req, res) => {
     ? Number(branch.free_delivery_over_status)
     : (bData.free_delivery_over_status != null ? Number(bData.free_delivery_over_status) : (freeOver > 0 ? 1 : 0));
 
+  const subtotal = Number(req.query.subtotal || req.query.amount || 0);
+  const isFree = freeOver > 0 && subtotal >= freeOver;
+  const distance = Number(req.query.distance || 2.4);
+
   ok(res, {
-    delivery_fee: fee,
+    delivery_fee: isFree ? 0 : fee,
+    distance_km: distance,
+    free_delivery: isFree,
     min_order: minOrder,
     delivery_charge_setup: {
       free_delivery_over_amount: freeOver,
@@ -1132,20 +1318,25 @@ router.get('/config/check-postcode', asyncHandler(async (req, res) => {
       const freeOver = Number(matchedZone.free_delivery_over ?? matchedZone.free_delivery_over_amount ?? 0);
       const freeStatus = matchedZone.free_delivery_over_status ? 1 : (freeOver > 0 ? 1 : 0);
       return ok(res, {
+        deliverable: true,
         is_covered: true,
+        zone: matchedZone.name || 'Local Delivery Zone',
+        zone_id: matchedZone.id || null,
+        zone_name: matchedZone.name || null,
+        delivery_fee: fee,
+        delivery_charge: fee,
+        estimated_delivery_minutes: 45,
         postcode: rawPostcode.toUpperCase(),
         postcode_normalized: normalized,
-        delivery_charge: fee,
         min_order: minOrder,
         free_delivery_over_amount: freeOver,
         free_delivery_over_status: freeStatus,
-        zone_id: matchedZone.id || null,
-        zone_name: matchedZone.name || null,
         message: 'We deliver to this location',
       });
     }
 
     return ok(res, {
+      deliverable: false,
       is_covered: false,
       postcode: rawPostcode.toUpperCase(),
       postcode_normalized: normalized,
@@ -1155,10 +1346,14 @@ router.get('/config/check-postcode', asyncHandler(async (req, res) => {
 
   // Default fallback if no zones defined: open delivery
   ok(res, {
+    deliverable: true,
     is_covered: true,
+    zone: 'London Central Delivery Zone',
+    delivery_fee: 2.50,
+    delivery_charge: 2.50,
+    estimated_delivery_minutes: 45,
     postcode: rawPostcode.toUpperCase(),
     postcode_normalized: normalized,
-    delivery_charge: 2.50,
     min_order: 10.00,
     free_delivery_over_amount: 0,
     free_delivery_over_status: 0,
@@ -1225,7 +1420,10 @@ async function applyCouponHandler(req, res) {
   const r = rid(req);
   const code = String(req.query.code || req.body?.code || '').trim();
   if (!code) throw badRequest('Coupon code is required');
-  const amount = Number(req.query.amount || req.query.order_amount || req.body?.amount || req.body?.order_amount || 0);
+  const amount = Number(
+    req.query.amount || req.query.order_amount || req.query.subtotal ||
+    req.body?.amount || req.body?.order_amount || req.body?.subtotal || 0
+  );
 
   const { rows } = await pool.query(
     `SELECT * FROM coupons WHERE restaurant_id = $1 AND LOWER(code) = LOWER($2)`,
@@ -1268,9 +1466,19 @@ async function applyCouponHandler(req, res) {
   const finalAmount = amount > 0 ? Math.max(0, Math.round((amount - discountAmount) * 100) / 100) : 0;
 
   ok(res, {
+    valid: true,
     ...coupon,
     discount_amount: discountAmount,
     final_amount: finalAmount,
+    coupon: {
+      id: coupon.id,
+      code: coupon.code,
+      title: coupon.title,
+      discount_type: coupon.discount_type,
+      discount: discountVal,
+      min_spend: minPurchase,
+      expiry: coupon.expire_at,
+    },
   });
 }
 
@@ -1360,7 +1568,12 @@ router.get('/customer/address/list', asyncHandler(async (req, res) => {
      ORDER BY is_default DESC, id DESC`,
     [custId, r],
   );
-  ok(res, rows);
+  const formatted = rows.map((a) => ({
+    ...a,
+    address_line_1: a.line1 || a.address,
+    address_line_2: a.line2 || '',
+  }));
+  ok(res, formatted);
 }));
 
 router.post('/customer/address/add', asyncHandler(async (req, res) => {
@@ -1372,9 +1585,9 @@ router.post('/customer/address/add', asyncHandler(async (req, res) => {
   const addressType = body.address_type || 'home';
   const contactName = body.contact_person_name || body.name || '';
   const contactNumber = body.contact_person_number || body.phone || '';
-  const addressText = body.address || [body.line1, body.line2, body.city, body.postcode].filter(Boolean).join(', ');
-  const line1 = body.line1 || body.address || '';
-  const line2 = body.line2 || '';
+  const line1 = body.line1 || body.address_line_1 || body.address || '';
+  const line2 = body.line2 || body.address_line_2 || '';
+  const addressText = body.address || [line1, line2, body.city, body.postcode].filter(Boolean).join(', ');
   const city = body.city || '';
   const postcode = (body.postcode || '').trim().toUpperCase();
   const isDefault = !!body.is_default;
@@ -1398,7 +1611,13 @@ router.post('/customer/address/add', asyncHandler(async (req, res) => {
       isDefault, JSON.stringify(body.data || {}),
     ],
   );
-  created(res, rows[0]);
+  created(res, {
+    message: 'Address saved successfully',
+    address_id: rows[0].id,
+    ...rows[0],
+    address_line_1: rows[0].line1,
+    address_line_2: rows[0].line2,
+  });
 }));
 
 async function updateAddressHandler(req, res) {
@@ -1425,9 +1644,9 @@ async function updateAddressHandler(req, res) {
   const addressType = body.address_type != null ? body.address_type : cur.address_type;
   const contactName = body.contact_person_name != null ? body.contact_person_name : cur.contact_person_name;
   const contactNumber = body.contact_person_number != null ? body.contact_person_number : cur.contact_person_number;
+  const line1 = body.line1 != null ? body.line1 : (body.address_line_1 != null ? body.address_line_1 : cur.line1);
+  const line2 = body.line2 != null ? body.line2 : (body.address_line_2 != null ? body.address_line_2 : cur.line2);
   const addressText = body.address != null ? body.address : cur.address;
-  const line1 = body.line1 != null ? body.line1 : cur.line1;
-  const line2 = body.line2 != null ? body.line2 : cur.line2;
   const city = body.city != null ? body.city : cur.city;
   const postcode = body.postcode != null ? String(body.postcode).trim().toUpperCase() : cur.postcode;
   const latitude = body.latitude != null ? Number(body.latitude) : cur.latitude;
@@ -1445,7 +1664,12 @@ async function updateAddressHandler(req, res) {
       addressText, line1, line2, city, postcode, latitude, longitude, isDefault,
     ],
   );
-  ok(res, rows[0]);
+  ok(res, {
+    message: 'Address updated successfully',
+    ...rows[0],
+    address_line_1: rows[0].line1,
+    address_line_2: rows[0].line2,
+  });
 }
 
 router.post('/customer/address/update/:id', asyncHandler(updateAddressHandler));

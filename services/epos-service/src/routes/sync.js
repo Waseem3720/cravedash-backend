@@ -25,7 +25,7 @@ function rid(req) {
 
 async function applyItem(req, item) {
   const r = rid(req);
-  const key = String(item.idempotency_key || '');
+  const key = String(item.idempotency_key || item.key || '');
   if (!key) return { key: '', status: 'error', error: 'missing idempotency_key' };
 
   const { rows: existing } = await pool.query(
@@ -42,11 +42,15 @@ async function applyItem(req, item) {
     };
   }
 
-  const entity = String(item.entity || '');
-  const op = String(item.op || '');
+  const entity = String(item.entity || item.type || '');
+  let op = String(item.op || '');
+  if (!op) {
+    if (entity === 'order') op = 'create';
+    else if (entity === 'held') op = 'upsert';
+  }
   const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
   let serverId = null;
-  let clientId = payload.client_id || payload.id || null;
+  let clientId = item.client_id || payload.client_id || payload.id || null;
   let result = {};
 
   try {

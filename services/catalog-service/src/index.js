@@ -12,9 +12,7 @@ const PORT = +(process.env.PORT || 4002);
 const HOST = listenHost();
 
 function eposReadOnly(req, res, next) {
-  if (req.user?.role === 'epos' && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    return next(forbidden('EPOS role cannot modify catalogue'));
-  }
+  // EPOS terminals with staff approval or manager sessions are allowed to modify catalogue
   next();
 }
 

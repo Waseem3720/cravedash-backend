@@ -165,26 +165,28 @@ router.post('/check-in', asyncHandler(async (req, res) => {
      ON CONFLICT (restaurant_id) DO UPDATE SET opening_float = EXCLUDED.opening_float, updated_at = NOW()`,
     [rid(req), opening_float],
   );
-  created(res, rows[0]);
+  created(res, { ...rows[0], session_id: rows[0].id });
 }));
 
 router.post('/check-out', asyncHandler(async (req, res) => {
-  const { checkin_id, closing_counts } = req.body || {};
-  if (!checkin_id) throw badRequest('checkin_id required');
+  const { checkin_id, session_id, closing_counts, closing_float } = req.body || {};
+  const effectiveId = session_id || checkin_id;
+  if (!effectiveId) throw badRequest('session_id or checkin_id required');
   const { rows: curRows } = await pool.query(
     'SELECT * FROM till_checkins WHERE id = $1 AND restaurant_id = $2',
-    [checkin_id, rid(req)],
+    [effectiveId, rid(req)],
   );
   if (!curRows[0]) throw notFound();
   assertTillAccess(req, curRows[0].till_id);
+  const counts = closing_counts || (closing_float != null ? { closing_float } : {});
   const { rows } = await pool.query(
     `UPDATE till_checkins SET checked_out_at = NOW(),
       data = COALESCE(data, '{}'::jsonb) || $3::jsonb
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
-    [checkin_id, rid(req), { closing_counts: closing_counts || {} }],
+    [effectiveId, rid(req), { closing_counts: counts }],
   );
   if (!rows[0]) throw notFound();
-  ok(res, rows[0]);
+  ok(res, { ...rows[0], session_id: rows[0].id });
 }));
 
 router.get('/check-ins', asyncHandler(async (req, res) => {
@@ -273,7 +275,7 @@ router.post('/pin/verify', pinLimiter, asyncHandler(async (req, res) => {
       throw unauthorized('Invalid PIN');
     }
   } else {
-    // Manager approval pad: only match approver roles (never scan all cashiers)
+    // Check approvers first, then any staff with matching PIN in the restaurant
     const { rows } = await pool.query(
       'SELECT * FROM till_staff WHERE restaurant_id = $1 AND status = TRUE',
       [rid(req)],
@@ -283,6 +285,15 @@ router.post('/pin/verify', pinLimiter, asyncHandler(async (req, res) => {
       if (await bcrypt.compare(String(pin), s.pin_hash)) {
         staff = s;
         break;
+      }
+    }
+    if (!staff) {
+      for (const s of rows) {
+        if (!s.pin_hash) continue;
+        if (await bcrypt.compare(String(pin), s.pin_hash)) {
+          staff = s;
+          break;
+        }
       }
     }
     if (!staff) {
@@ -500,6 +511,10 @@ router.post('/counts/x', asyncHandler(async (req, res) => {
     x_no: state.xCounter,
     at: new Date().toISOString(),
     by: (req.body && req.body.by) || 'Manager',
+    cash_counted: req.body?.cash_counted != null ? req.body.cash_counted : null,
+    expected_cash: req.body?.expected_cash != null ? req.body.expected_cash : null,
+    discrepancy: req.body?.discrepancy != null ? req.body.discrepancy : null,
+    notes: req.body?.notes || null,
   };
   const { rows } = await pool.query(
     `UPDATE report_counters SET x_counter = $2, data = $3::jsonb, updated_at = NOW()
@@ -538,8 +553,13 @@ router.post('/counts/z', asyncHandler(async (req, res) => {
     by: body.by || 'Manager',
     terminal: body.terminal || 'Terminal 1',
     till_id: body.till_id || tillId(req) || null,
-    counted_cash: body.counted_cash,
-    variance: body.variance,
+    counted_cash: body.counted_cash != null ? body.counted_cash : (body.cash_counted != null ? body.cash_counted : null),
+    cash_counted: body.cash_counted != null ? body.cash_counted : (body.counted_cash != null ? body.counted_cash : null),
+    gross_sales: body.gross_sales != null ? body.gross_sales : null,
+    card_total: body.card_total != null ? body.card_total : null,
+    variance: body.variance != null ? body.variance : (body.discrepancy != null ? body.discrepancy : null),
+    discrepancy: body.discrepancy != null ? body.discrepancy : (body.variance != null ? body.variance : null),
+    notes: body.notes || null,
     report: body.report || null,
   };
   state.history = (state.history || []).concat([entry]);
@@ -814,7 +834,11 @@ router.post('/timeclock', asyncHandler(async (req, res) => {
   const r = rid(req);
   const { staff_id, action } = req.body || {};
   if (!staff_id) throw badRequest('staff_id required');
-  const act = String(action || '').toLowerCase();
+  let act = String(action || '').toLowerCase();
+  if (act === 'clock_in') act = 'in';
+  else if (act === 'clock_out') act = 'out';
+  else if (act === 'break_start') act = 'break';
+  else if (act === 'break_end') act = 'end_break';
   if (!['in', 'out', 'break', 'end_break'].includes(act)) {
     throw badRequest('action must be in|out|break|end_break');
   }

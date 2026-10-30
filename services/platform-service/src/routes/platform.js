@@ -569,6 +569,36 @@ function assertTicketAccess(req, row) {
     if (req.user?.role !== 'super') body.status = body.status || 'open';
     created(res, await crud.create(body, null));
   }));
+  router.post('/support/contact', asyncHandler(async (req, res) => {
+    const forceRid = req.user?.restaurant_id || req.headers['x-restaurant-id'] || 'r1';
+    const body = req.body || {};
+    const ticketId = `TK-${Date.now().toString(36)}`;
+    const ticketRecord = {
+      id: ticketId,
+      restaurant_id: forceRid,
+      subject: `Kitchen Support Inquiry: ${body.message ? String(body.message).slice(0, 40) : 'Inquiry'}...`,
+      status: 'open',
+      priority: 'normal',
+      messages: [{
+        sender: body.email || 'Chef',
+        phone: body.phone ? `${body.country_code || ''}${body.phone}` : '',
+        body: body.message || 'Support inquiry from chef',
+        at: new Date().toISOString(),
+      }],
+      data: {
+        email: body.email,
+        phone: body.phone,
+        country_code: body.country_code,
+        source: 'chef_app',
+      },
+    };
+    await crud.create(ticketRecord, null);
+    created(res, {
+      ticket_id: ticketId,
+      message: 'Support inquiry submitted successfully',
+      created_at: new Date().toISOString(),
+    });
+  }));
   router.put('/support-tickets/:id', asyncHandler(async (req, res) => {
     const existing = assertTicketAccess(req, await crud.getById(req.params.id, null));
     const forceRid = req.user?.role === 'super' ? undefined : existing.restaurant_id;

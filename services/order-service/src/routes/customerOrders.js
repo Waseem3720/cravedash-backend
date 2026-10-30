@@ -293,14 +293,11 @@ router.post('/calculate', optionalAuth, asyncHandler(async (req, res) => {
  * POST /api/v1/customer/order/place
  * Places an authoritative order linked to the authenticated customer.
  */
-router.post('/place', requireAuth, asyncHandler(async (req, res) => {
+router.post('/place', optionalAuth, asyncHandler(async (req, res) => {
   const rid = restaurantId(req);
-  const customerId = req.user.sub || req.user.id;
-  if (!customerId) {
-    throw unauthorized('Customer identity required to place an order');
-  }
-
   const body = req.body || {};
+  const customerId = req.user?.sub || req.user?.id || (body.customer && body.customer.id) || `guest_${Date.now().toString(36)}`;
+
   const idempotencyKey = req.headers['idempotency-key'] || body.idempotency_key || null;
 
   // Idempotency check: if already placed with this key, return existing order
@@ -416,16 +413,22 @@ router.post('/place', requireAuth, asyncHandler(async (req, res) => {
     const orderId = Number(seqRows[0].id);
 
     // 6. Customer record lookup
-    const { rows: custRows } = await client.query(
-      `SELECT id, name, email, phone FROM customers WHERE id = $1 AND restaurant_id = $2`,
-      [customerId, rid],
-    );
-    const customerSnapshot = custRows[0] || {
-      id: customerId,
-      name: req.user.name || '',
-      email: req.user.email || '',
-      phone: req.user.phone || '',
-    };
+    let customerSnapshot = null;
+    if (req.user?.sub || req.user?.id) {
+      const { rows: custRows } = await client.query(
+        `SELECT id, name, email, phone FROM customers WHERE id = $1 AND restaurant_id = $2`,
+        [customerId, rid],
+      );
+      customerSnapshot = custRows[0];
+    }
+    if (!customerSnapshot) {
+      customerSnapshot = {
+        id: customerId,
+        name: body.customer?.name || deliveryAddress?.contact_person_name || req.user?.name || 'Guest Customer',
+        email: body.customer?.email || req.user?.email || '',
+        phone: body.customer?.phone || deliveryAddress?.contact_person_number || req.user?.phone || '',
+      };
+    }
 
     // 7. Assemble order object
     const history = [{ status: 'pending', at: new Date().toISOString(), by: 'Customer' }];
@@ -462,7 +465,17 @@ router.post('/place', requireAuth, asyncHandler(async (req, res) => {
     await client.query('COMMIT');
     const createdOrder = parseOrder(inserted[0]);
     created(res, {
-      order_id: Number(createdOrder.id),
+      order_id: String(createdOrder.id),
+      id: createdOrder.id,
+      status: createdOrder.status,
+      created_at: createdOrder.created_at,
+      order_type: createdOrder.order_type,
+      payment_method: createdOrder.payment_method,
+      payment_status: createdOrder.payment_status,
+      subtotal: createdOrder.subtotal,
+      discount: createdOrder.discount,
+      delivery_charge: createdOrder.delivery_charge,
+      total: createdOrder.total,
       message: 'Order placed successfully',
       order: createdOrder,
     });

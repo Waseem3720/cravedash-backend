@@ -67,6 +67,10 @@ function restaurantId(req) {
   if (req.headers && req.headers['x-restaurant-id']) {
     return req.headers['x-restaurant-id'];
   }
+  // Storefront single-tenant / default restaurant fallback
+  if (process.env.DEFAULT_RESTAURANT_ID || 'r1') {
+    return process.env.DEFAULT_RESTAURANT_ID || 'r1';
+  }
   throw badRequest('restaurant_id missing from session');
 }
 
