@@ -25,7 +25,7 @@ function rid(req) {
 
 async function applyItem(req, item) {
   const r = rid(req);
-  const key = String(item.idempotency_key || '');
+  const key = String(item.idempotency_key || item.key || '');
   if (!key) return { key: '', status: 'error', error: 'missing idempotency_key' };
 
   const { rows: existing } = await pool.query(
@@ -42,8 +42,8 @@ async function applyItem(req, item) {
     };
   }
 
-  const entity = String(item.entity || '');
-  const op = String(item.op || '');
+  const entity = String(item.entity || item.type || '');
+  const op = String(item.op || (entity === 'order' ? 'create' : ''));
   const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
   let serverId = null;
   let clientId = payload.client_id || payload.id || null;
@@ -194,7 +194,30 @@ router.post(
   asyncHandler(async (req, res) => {
     await ensureSyncTables();
     if (!rid(req)) throw badRequest('restaurant_id required');
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    let items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length && req.body?.batches && typeof req.body.batches === 'object') {
+      const b = req.body.batches;
+      if (Array.isArray(b.orders)) {
+        for (const o of b.orders) {
+          items.push({
+            idempotency_key: o.idempotency_key || `sync_ord_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            entity: 'order',
+            op: 'create',
+            payload: o,
+          });
+        }
+      }
+      if (Array.isArray(b.held_orders)) {
+        for (const h of b.held_orders) {
+          items.push({
+            idempotency_key: h.idempotency_key || `sync_held_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            entity: 'held',
+            op: 'upsert',
+            payload: h,
+          });
+        }
+      }
+    }
     if (!items.length) throw badRequest('items required');
     const results = [];
     for (const item of items) {

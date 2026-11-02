@@ -442,7 +442,9 @@ VALUES
   ('u_super', 'owner@cravedash.co.uk', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'super', 'Platform Owner', NULL, NULL),
   ('u_super_legacy', 'admin@cravedash.co.uk', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'super', 'Master Admin', NULL, NULL),
   ('u_owner', 'owner@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'restaurant', 'Faisal', 'r1', NULL),
+  ('u_admin_alias', 'admin@cravedash.com', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'restaurant', 'Porto Admin', 'r1', NULL),
   ('u_epos', 'till1@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till 1', 'r1', 'till-1'),
+  ('u_epos_alias', 'till1@cravedash.com', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till 1 - Front Counter', 'r1', 'till-1'),
   ('u_epos_legacy', 'till@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till User', 'r1', 'till-1')
 ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, name = EXCLUDED.name,
   restaurant_id = EXCLUDED.restaurant_id, till_id = EXCLUDED.till_id, status = TRUE;
@@ -451,12 +453,20 @@ INSERT INTO restaurant_settings (restaurant_id, settings)
 VALUES ('r1', '{"vat_rate":20,"vat_inclusive":true,"restaurant_name":"Porto Piri Piri","auto_accept_pos":true}')
 ON CONFLICT (restaurant_id) DO NOTHING;
 
-INSERT INTO epos_tills (id, restaurant_id, name) VALUES ('till-1', 'r1', 'Till 1')
+INSERT INTO epos_tills (id, restaurant_id, name) VALUES
+  ('till-1', 'r1', 'Till 1'),
+  ('till_01', 'r1', 'Till 1 - Front Counter'),
+  ('till_main_01', 'r1', 'Till Main')
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO till_staff (id, restaurant_id, name, pin_hash, role, till_id)
-VALUES ('ts1', 'r1', 'Alex Khan', '$2b$10$SDVmB/0aC5IXEalVR2KgEOknOTuFeCwLSzvIXsOBl/VM8J7aLQNn.', 'manager', 'till-1')
-ON CONFLICT (id) DO NOTHING;
+INSERT INTO till_staff (id, restaurant_id, name, pin_hash, role, till_id, status, data)
+VALUES
+  ('ts1', 'r1', 'Alex Khan', '$2a$10$LOIJqFvEWW2LnVHUZqiM9O7NjVcFvYXHd5XGslc3DTX.YIBP8n23m', 'manager', 'till-1', TRUE, '{"can_approve":true}'),
+  ('stf_alex_01', 'r1', 'Alex Khan', '$2a$10$LOIJqFvEWW2LnVHUZqiM9O7NjVcFvYXHd5XGslc3DTX.YIBP8n23m', 'manager', 'till-1', TRUE, '{"can_approve":true}'),
+  ('ts2', 'r1', 'Sarah Johnson', '$2a$10$lQworfokaGNCkPPd.8meZ.Sdi8F2TBnEGpJhDrCFKmFD6WaCIHHVO', 'supervisor', 'till-1', TRUE, '{"can_approve":true}'),
+  ('ts3', 'r1', 'Maria Clarke', '$2a$10$9q8Rjaetbjf9Oy/ZevegTeMYrFG.cc56JMs/lPqFjI1w.2auouOmy', 'cashier', 'till-1', TRUE, '{"can_approve":false}'),
+  ('ts4', 'r1', 'Omar Ali', '$2a$10$ROi2ViYgYX77zT9AqeCIXO9ce.oZM0q447fCKJwDotBkVJC57ffPK', 'cashier', 'till-1', TRUE, '{"can_approve":false}')
+ON CONFLICT (id) DO UPDATE SET pin_hash = EXCLUDED.pin_hash, name = EXCLUDED.name, role = EXCLUDED.role, data = EXCLUDED.data, status = TRUE;
 
 INSERT INTO categories (id, restaurant_id, num, name, colour, text_colour, priority, status)
 VALUES ('cat1', 'r1', 1, 'Burger', '#0b84f3', '#ffffff', 1, TRUE)
@@ -482,9 +492,37 @@ INSERT INTO coupons (id, restaurant_id, title, code, discount_type, discount, mi
 VALUES ('cp1', 'r1', 'Summer Sale', 'SUMMER10', 'percent', 10, 10, TRUE)
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO customers (id, restaurant_id, name, email, phone, wallet_balance)
-VALUES ('cust1', 'r1', 'Liam Smith', 'liam@example.com', '07123456789', 12.50)
+INSERT INTO customers (id, restaurant_id, name, email, phone, wallet_balance, loyalty_points, data, status)
+VALUES
+  ('cust1', 'r1', 'Liam Smith', 'liam@example.com', '07123456789', 12.50, 0, '{}'::jsonb, TRUE),
+  ('cust_1002', 'r1', 'Alex Johnson', 'alex.j@example.com', '+447123456789', 15.00, 120, '{"address":"12 High Street","city":"Glasgow","postcode":"SW1A 1AA","notes":"Door code #4321","allergies":["nuts"],"rating":5}'::jsonb, TRUE),
+  ('cust_demo_delete', 'r1', 'Demo Deletable Customer', 'deletable@example.com', '+447000000999', 0, 0, '{"address":"Demo Lane"}'::jsonb, TRUE)
 ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO categories (id, restaurant_id, num, name, colour, text_colour, priority, status)
+VALUES ('cat_demo_delete', 'r1', 99, 'Temporary Test Category', '#999999', '#ffffff', 99, TRUE)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO products (id, restaurant_id, name, category_id, price, from_price, data, status, visible, description)
+VALUES ('p_demo_delete', 'r1', 'Temporary Test Burger', 'cat_demo_delete', 4.50, 4.50, '{"product_type":"veg"}'::jsonb, TRUE, TRUE, 'Temporary test item for DELETE endpoint')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO held_orders (id, restaurant_id, till_id, label, payload)
+VALUES ('hold_m29bk14', 'r1', 'till-1', 'Window Table 7 - Sarah', '{"id":"hold_m29bk14","till_id":"till-1","label":"Window Table 7 - Sarah","cart":{"items":[{"product_id":"p1","name":"Classic Burger","price":8.99,"qty":2,"addons":[]}],"subtotal":17.98,"total":17.98},"customer":{"name":"Sarah","phone":"+447700900123"}}'::jsonb)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO orders (
+  id, restaurant_id, branch, branch_id, source, order_type, status, payment_status, payment_method,
+  customer, table_id, guests, items, subtotal, discount, delivery_charge, service_charge, tip,
+  total, note, history, acknowledged, data
+) VALUES (
+  10041, 'r1', 'Main Branch', 'main', 'epos', 'dine_in', 'pending', 'unpaid', 'cash',
+  '{"name":"Walk-in Customer","phone":"+447123456789"}'::jsonb, 'T1', 2,
+  '[{"id":"p1","name":"Classic Burger","price":8.99,"quantity":2,"total":17.98},{"id":"ad1","name":"Extra Cheese","price":0.60,"quantity":2,"total":1.20}]'::jsonb,
+  19.18, 0, 0, 1.82, 0, 21.00, 'Table 1 - Dine In',
+  '[{"status":"pending","at":"2026-11-02T10:00:00.000Z","by":"Till 1"}]'::jsonb,
+  FALSE, '{"client_id":"ord_client_10041","source":"epos","dining_type":"dine_in","table_number":"1"}'::jsonb
+) ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO areas (id, restaurant_id, name) VALUES ('area1', 'r1', 'Main Hall')
 ON CONFLICT (id) DO NOTHING;
@@ -504,3 +542,13 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO report_counters (restaurant_id, period_start, x_counter, z_counter, opening_float)
 VALUES ('r1', CURRENT_DATE, 482, 1041, 150)
 ON CONFLICT (restaurant_id) DO NOTHING;
+
+INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+VALUES
+  ('u_chef_musa', 'musamasufi.dev@gmail.com', '$2a$10$1ClHi6rkLPo0HWHw1myFp.XW0uaAwNwj6k0bdLQPfnhoXABKbcDu2', 'chef', 'Musa Chef', 'r1')
+ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, name = EXCLUDED.name, restaurant_id = EXCLUDED.restaurant_id, status = TRUE;
+
+INSERT INTO chefs (id, restaurant_id, name, email, phone, status, password_hash, data)
+VALUES
+  ('chef_musa', 'r1', 'Musa Chef', 'musamasufi.dev@gmail.com', '07700900222', TRUE, '$2a$10$1ClHi6rkLPo0HWHw1myFp.XW0uaAwNwj6k0bdLQPfnhoXABKbcDu2', '{"password_hash":"$2a$10$1ClHi6rkLPo0HWHw1myFp.XW0uaAwNwj6k0bdLQPfnhoXABKbcDu2","alt_password_hash":"$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq","pin_hash":"$2a$10$LOIJqFvEWW2LnVHUZqiM9O7NjVcFvYXHd5XGslc3DTX.YIBP8n23m"}'::jsonb)
+ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data, email = EXCLUDED.email;

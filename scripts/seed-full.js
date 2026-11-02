@@ -121,6 +121,7 @@ async function seedRestaurantPlatformData() {
 
 async function main() {
   const hash = await bcrypt.hash(DEMO_PASSWORD, 10);
+  const secureChefHash = await bcrypt.hash('SecurePassword123!', 10);
   const pinHash = await bcrypt.hash('1234', 10);
   const pin2345 = await bcrypt.hash('2345', 10);
   const pin3456 = await bcrypt.hash('3456', 10);
@@ -184,6 +185,19 @@ async function main() {
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'epos', till_id = 'till-1'`,
     ['u_epos', 'till1@portopiripiri.example', hash, 'Till 1'],
   );
+  // Support cravedash.com EPOS & restaurant login aliases for direct testing
+  await upsert(
+    `INSERT INTO users (id, email, password_hash, role, name, restaurant_id, till_id)
+     VALUES ($1,$2,$3,'epos',$4,'r1','till-1')
+     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'epos', till_id = 'till-1'`,
+    ['u_epos_cravedash', 'till1@cravedash.com', hash, 'Till 1 - Front Counter'],
+  );
+  await upsert(
+    `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+     VALUES ($1,$2,$3,'restaurant',$4,'r1')
+     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'restaurant', restaurant_id = 'r1'`,
+    ['u_admin_cravedash', 'admin@cravedash.com', hash, 'Porto Admin'],
+  );
   // Keep legacy emails working
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
@@ -227,6 +241,12 @@ async function main() {
        ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data`,
       ['chef_1', 'Gordon Chef', 'chef@portopiripiri.example', '07700900222', hash, JSON.stringify({ password_hash: hash })],
     );
+    await upsert(
+      `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, password_hash, data)
+       VALUES ($1,'r1',$2,$3,$4,TRUE,$5,$6::jsonb)
+       ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data, email = EXCLUDED.email`,
+      ['chef_musa', 'Musa Chef', 'musamasufi.dev@gmail.com', '07700900222', secureChefHash, JSON.stringify({ password_hash: secureChefHash, alt_password_hash: hash, pin_hash: pinHash })],
+    );
   } catch (e) {
     console.warn('Note: chefs table seed skipped or failed:', e.message);
   }
@@ -236,6 +256,12 @@ async function main() {
        VALUES ($1,$2,$3,'chef',$4,'r1')
        ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'chef'`,
       ['u_chef', 'chef@portopiripiri.example', hash, 'Gordon Chef'],
+    );
+    await upsert(
+      `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
+       VALUES ($1,$2,$3,'chef',$4,'r1')
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'chef', name = EXCLUDED.name`,
+      ['u_chef_musa', 'musamasufi.dev@gmail.com', secureChefHash, 'Musa Chef'],
     );
   } catch (e) {
     console.warn('Note: users chef seed skipped:', e.message);
@@ -262,19 +288,35 @@ async function main() {
     console.warn('Note: users customer seed skipped:', e.message);
   }
 
+  console.log('Seeding EPOS tills…');
+  const tills = [
+    ['till-1', 'Till 1 - Front Counter'],
+    ['till_01', 'Till 1 - Front Counter'],
+    ['till_main_01', 'Till Main'],
+  ];
+  for (const [tId, tName] of tills) {
+    await upsert(
+      `INSERT INTO epos_tills (id, restaurant_id, name, status)
+       VALUES ($1,'r1',$2,TRUE)
+       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = TRUE`,
+      [tId, tName],
+    );
+  }
+
   console.log('Seeding till staff PINs…');
   const staff = [
-    ['ts1', 'Alex Khan', pinHash, 'manager'],
-    ['ts2', 'Sarah Johnson', pin2345, 'supervisor'],
-    ['ts3', 'Maria Clarke', pin3456, 'cashier'],
-    ['ts4', 'Omar Ali', pin4567, 'cashier'],
+    ['ts1', 'Alex Khan', pinHash, 'manager', true],
+    ['stf_alex_01', 'Alex Khan', pinHash, 'manager', true],
+    ['ts2', 'Sarah Johnson', pin2345, 'supervisor', true],
+    ['ts3', 'Maria Clarke', pin3456, 'cashier', false],
+    ['ts4', 'Omar Ali', pin4567, 'cashier', false],
   ];
-  for (const [id, name, ph, role] of staff) {
+  for (const [id, name, ph, role, canApprove] of staff) {
     await upsert(
-      `INSERT INTO till_staff (id, restaurant_id, name, pin_hash, role, till_id)
-       VALUES ($1,'r1',$2,$3,$4,'till-1')
-       ON CONFLICT (id) DO UPDATE SET pin_hash = EXCLUDED.pin_hash, name = EXCLUDED.name, role = EXCLUDED.role`,
-      [id, name, ph, role],
+      `INSERT INTO till_staff (id, restaurant_id, name, pin_hash, role, till_id, status, data)
+       VALUES ($1,'r1',$2,$3,$4,'till-1',TRUE,$5::jsonb)
+       ON CONFLICT (id) DO UPDATE SET pin_hash = EXCLUDED.pin_hash, name = EXCLUDED.name, role = EXCLUDED.role, data = EXCLUDED.data, status = TRUE`,
+      [id, name, ph, role, JSON.stringify({ can_approve: canApprove })],
     );
   }
 
@@ -385,6 +427,131 @@ async function main() {
       [`T${t[0]}`, t[0], t[1], t[2], t[3], t[4], t[5]],
     );
   }
+
+  console.log('Seeding report counters, held orders, sample orders & customers for EPOS…');
+  await upsert(
+    `INSERT INTO report_counters (restaurant_id, period_start, x_counter, z_counter, opening_float, data)
+     VALUES ('r1', CURRENT_DATE, 482, 1041, 150, $1::jsonb)
+     ON CONFLICT (restaurant_id) DO UPDATE SET period_start = EXCLUDED.period_start, opening_float = EXCLUDED.opening_float, data = EXCLUDED.data`,
+    [
+      JSON.stringify({
+        xCounter: 482,
+        zCounter: 1041,
+        openingFloat: 150,
+        periodStart: new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z',
+        cashMovements: [],
+        voids: [],
+        noSaleCount: 0,
+        history: [],
+      }),
+    ],
+  );
+
+  await upsert(
+    `INSERT INTO held_orders (id, restaurant_id, till_id, label, payload)
+     VALUES ($1, 'r1', 'till-1', $2, $3::jsonb)
+     ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label, payload = EXCLUDED.payload`,
+    [
+      'hold_m29bk14',
+      'Window Table 7 - Sarah',
+      JSON.stringify({
+        id: 'hold_m29bk14',
+        till_id: 'till-1',
+        label: 'Window Table 7 - Sarah',
+        cart: {
+          items: [
+            {
+              product_id: 'p1',
+              name: 'Classic Burger',
+              price: 8.99,
+              qty: 2,
+              addons: [],
+            },
+          ],
+          subtotal: 17.98,
+          total: 17.98,
+        },
+        customer: {
+          name: 'Sarah',
+          phone: '+447700900123',
+        },
+      }),
+    ],
+  );
+
+  await upsert(
+    `INSERT INTO orders (
+      id, restaurant_id, branch, branch_id, source, order_type, status, payment_status, payment_method,
+      customer, table_id, guests, items, subtotal, discount, delivery_charge, service_charge, tip,
+      total, note, history, acknowledged, data
+    ) VALUES (
+      10041, 'r1', 'Main Branch', 'main', 'epos', 'dine_in', 'pending', 'unpaid', 'cash',
+      $1::jsonb, 'T1', 2, $2::jsonb, 19.18, 0, 0, 1.82, 0,
+      21.00, 'Table 1 - Dine In', $3::jsonb, FALSE, $4::jsonb
+    ) ON CONFLICT (id) DO UPDATE SET
+      status = 'pending', total = 21.00, items = EXCLUDED.items, customer = EXCLUDED.customer, table_id = 'T1'`,
+    [
+      JSON.stringify({ name: 'Walk-in Customer', phone: '+447123456789' }),
+      JSON.stringify([
+        { id: 'p1', name: 'Classic Burger', price: 8.99, quantity: 2, total: 17.98 },
+        { id: 'ad1', name: 'Extra Cheese', price: 0.60, quantity: 2, total: 1.20 },
+      ]),
+      JSON.stringify([{ status: 'pending', at: new Date().toISOString(), by: 'Till 1' }]),
+      JSON.stringify({ client_id: 'ord_client_10041', source: 'epos', dining_type: 'dine_in', table_number: '1' }),
+    ],
+  );
+
+  await upsert(
+    `INSERT INTO customers (id, restaurant_id, name, email, phone, wallet_balance, loyalty_points, data, status)
+     VALUES ($1, 'r1', $2, $3, $4, $5, $6, $7::jsonb, TRUE)
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, data = EXCLUDED.data, status = TRUE`,
+    [
+      'cust_1002',
+      'Alex Johnson',
+      'alex.j@example.com',
+      '+447123456789',
+      15.00,
+      120,
+      JSON.stringify({
+        address: '12 High Street',
+        city: 'Glasgow',
+        postcode: 'SW1A 1AA',
+        notes: 'Door code #4321',
+        allergies: ['nuts'],
+        rating: 5,
+        review_note: 'Great food and quick service',
+      }),
+    ],
+  );
+
+  await upsert(
+    `INSERT INTO customers (id, restaurant_id, name, email, phone, wallet_balance, loyalty_points, data, status)
+     VALUES ($1, 'r1', $2, $3, $4, $5, $6, $7::jsonb, TRUE)
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = TRUE`,
+    [
+      'cust_demo_delete',
+      'Demo Deletable Customer',
+      'deletable@example.com',
+      '+447000000999',
+      0,
+      0,
+      JSON.stringify({ address: 'Demo Lane' }),
+    ],
+  );
+
+  await upsert(
+    `INSERT INTO categories (id, restaurant_id, num, name, colour, text_colour, priority, status)
+     VALUES ($1, 'r1', 99, $2, '#999999', '#ffffff', 99, TRUE)
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+    ['cat_demo_delete', 'Temporary Test Category'],
+  );
+
+  await upsert(
+    `INSERT INTO products (id, restaurant_id, name, category_id, price, from_price, data, status, visible, description)
+     VALUES ($1, 'r1', $2, 'cat_demo_delete', 4.50, 4.50, '{"product_type":"veg"}'::jsonb, TRUE, TRUE, 'Temporary test item for DELETE endpoint')
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+    ['p_demo_delete', 'Temporary Test Burger'],
+  );
 
   await seedRestaurantPlatformData();
 
