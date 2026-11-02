@@ -42,6 +42,15 @@ WHERE o.customer_id IS NULL
     WHERE c.restaurant_id = o.restaurant_id AND c.id = o.customer->>'id'
   );
 
+-- Ensure no orphan customer_id violates the foreign key constraint
+UPDATE orders o
+SET customer_id = NULL
+WHERE o.customer_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM customers c
+    WHERE c.restaurant_id = o.restaurant_id AND c.id = o.customer_id
+  );
+
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_customer_fk') THEN
     ALTER TABLE orders ADD CONSTRAINT orders_customer_fk

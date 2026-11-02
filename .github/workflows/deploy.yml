@@ -85,7 +85,16 @@ jobs:
 
             # 5. Build and launch production stack
             echo "--- 2. Deploying stack with existing docker-compose.prod.yml ---"
-            $COMPOSE_CMD -f docker-compose.prod.yml up -d --build --remove-orphans
+            if ! $COMPOSE_CMD -f docker-compose.prod.yml up -d --build --remove-orphans; then
+              echo "=========================================================="
+              echo "ERROR: Stack deployment failed! Printing diagnostic logs:"
+              echo "=========================================================="
+              echo "--- Migrate container logs ---"
+              $COMPOSE_CMD -f docker-compose.prod.yml logs --tail 100 migrate || true
+              echo "--- Postgres container logs ---"
+              $COMPOSE_CMD -f docker-compose.prod.yml logs --tail 50 postgres || true
+              exit 1
+            fi
 
             # 6. Verify container status
             echo "--- 3. Verifying container status ---"

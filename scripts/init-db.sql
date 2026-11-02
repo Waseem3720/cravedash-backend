@@ -813,11 +813,29 @@ CREATE TABLE IF NOT EXISTS z_approvals (
 -- Branch-scoped, not restaurant-wide: an idempotent replay from another branch must create that branch's own order
 -- (ORD-H4, tests/orders-branch-scope.test.js). The earlier restaurant-wide index is dropped here if it was created.
 DROP INDEX IF EXISTS orders_restaurant_client_id_uniq;
+UPDATE orders
+SET data = data - 'client_id'
+WHERE data->>'client_id' IS NOT NULL
+  AND id NOT IN (
+    SELECT DISTINCT ON (restaurant_id, COALESCE(branch_id, 'main'), (data->>'client_id')) id
+    FROM orders
+    WHERE data->>'client_id' IS NOT NULL
+    ORDER BY restaurant_id, COALESCE(branch_id, 'main'), (data->>'client_id'), created_at DESC
+  );
 CREATE UNIQUE INDEX IF NOT EXISTS orders_branch_client_id_uniq
   ON orders (restaurant_id, branch_id, (data->>'client_id'))
   WHERE data->>'client_id' IS NOT NULL;
 
 -- ORD-M4: a till has at most one open check-in (checked_out_at IS NULL).
+UPDATE till_checkins
+SET checked_out_at = NOW()
+WHERE checked_out_at IS NULL
+  AND id NOT IN (
+    SELECT DISTINCT ON (restaurant_id, till_id) id
+    FROM till_checkins
+    WHERE checked_out_at IS NULL
+    ORDER BY restaurant_id, till_id, checked_in_at DESC
+  );
 CREATE UNIQUE INDEX IF NOT EXISTS till_checkins_one_open_idx
   ON till_checkins (restaurant_id, till_id)
   WHERE checked_out_at IS NULL;

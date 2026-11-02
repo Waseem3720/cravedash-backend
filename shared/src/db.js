@@ -1,19 +1,27 @@
 const { Pool } = require('pg');
 require('dotenv').config({ path: process.env.DOTENV_PATH || require('path').join(__dirname, '../../.env') });
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  host: process.env.PGHOST || 'localhost',
-  port: +(process.env.PGPORT || 5432),
-  user: process.env.PGUSER || 'cravedash',
-  password: process.env.PGPASSWORD || 'cravedash',
-  database: process.env.PGDATABASE || 'cravedash',
-  max: +(process.env.PGPOOL_MAX || 10),
-  // pg closes idle connections after 10s by default. Each new connection costs about a second on the local embedded
-  // database, and the admin screens poll every 30s, so every poll paid that cost. Keep idle connections for 5 minutes.
-  idleTimeoutMillis: +(process.env.PG_IDLE_TIMEOUT_MS || 300_000),
-  keepAlive: true,
-});
+// PRECEDENCE: Discrete parameters (PGHOST, PGPORT, etc.) take highest precedence when PGHOST is set.
+// This prevents DATABASE_URL (which often points to localhost for local dev) from overriding PGHOST=postgres in Docker.
+const poolConfig = process.env.PGHOST
+  ? {
+    host: process.env.PGHOST,
+    port: +(process.env.PGPORT || 5432),
+    user: process.env.PGUSER || 'cravedash',
+    password: process.env.PGPASSWORD || 'cravedash',
+    database: process.env.PGDATABASE || 'cravedash',
+    max: +(process.env.PGPOOL_MAX || 10),
+    idleTimeoutMillis: +(process.env.PG_IDLE_TIMEOUT_MS || 300_000),
+    keepAlive: true,
+  }
+  : {
+    connectionString: process.env.DATABASE_URL || 'postgres://cravedash:cravedash@localhost:5432/cravedash',
+    max: +(process.env.PGPOOL_MAX || 10),
+    idleTimeoutMillis: +(process.env.PG_IDLE_TIMEOUT_MS || 300_000),
+    keepAlive: true,
+  };
+
+const pool = new Pool(poolConfig);
 
 pool.on('error', (err) => {
   console.error('[pg] unexpected error', err);
