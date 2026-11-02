@@ -442,7 +442,7 @@ VALUES
   ('u_super', 'owner@cravedash.co.uk', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'super', 'Platform Owner', NULL, NULL),
   ('u_super_legacy', 'admin@cravedash.co.uk', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'super', 'Master Admin', NULL, NULL),
   ('u_owner', 'owner@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'restaurant', 'Faisal', 'r1', NULL),
-  ('u_admin_alias', 'admin@cravedash.com', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'restaurant', 'Porto Admin', 'r1', NULL),
+  ('u_admin_super', 'admin@cravedash.com', '$2a$10$cEj/R9KiI648sbiXVxlTIOacxFO3POfNneZ8/4Q7Nq6Zc/LxfxQA6', 'super', 'Master Super Admin', NULL, NULL),
   ('u_epos', 'till1@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till 1', 'r1', 'till-1'),
   ('u_epos_alias', 'till1@cravedash.com', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till 1 - Front Counter', 'r1', 'till-1'),
   ('u_epos_legacy', 'till@portopiripiri.example', '$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq', 'epos', 'Till User', 'r1', 'till-1')
@@ -495,6 +495,7 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO customers (id, restaurant_id, name, email, phone, wallet_balance, loyalty_points, data, status)
 VALUES
   ('cust1', 'r1', 'Liam Smith', 'liam@example.com', '07123456789', 12.50, 0, '{}'::jsonb, TRUE),
+  ('cust_example', 'r1', 'Example Customer', 'customer@example.com', '07123456789', 0, 0, '{"password_hash":"$2a$10$gY0WjJqIhtTUjrje2wyQdeoXh5KvNJ60y5tP4gDX0imqfJdnSXGMi"}'::jsonb, TRUE),
   ('cust_1002', 'r1', 'Alex Johnson', 'alex.j@example.com', '+447123456789', 15.00, 120, '{"address":"12 High Street","city":"Glasgow","postcode":"SW1A 1AA","notes":"Door code #4321","allergies":["nuts"],"rating":5}'::jsonb, TRUE),
   ('cust_demo_delete', 'r1', 'Demo Deletable Customer', 'deletable@example.com', '+447000000999', 0, 0, '{"address":"Demo Lane"}'::jsonb, TRUE)
 ON CONFLICT (id) DO NOTHING;
@@ -551,4 +552,9 @@ ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role =
 INSERT INTO chefs (id, restaurant_id, name, email, phone, status, password_hash, data)
 VALUES
   ('chef_musa', 'r1', 'Musa Chef', 'musamasufi.dev@gmail.com', '07700900222', TRUE, '$2a$10$1ClHi6rkLPo0HWHw1myFp.XW0uaAwNwj6k0bdLQPfnhoXABKbcDu2', '{"password_hash":"$2a$10$1ClHi6rkLPo0HWHw1myFp.XW0uaAwNwj6k0bdLQPfnhoXABKbcDu2","alt_password_hash":"$2a$10$sp7k4avkTd3tbQvq32dJCOLjKleS.km9nuTdvmppm6ANKdJgIhMOq","pin_hash":"$2a$10$LOIJqFvEWW2LnVHUZqiM9O7NjVcFvYXHd5XGslc3DTX.YIBP8n23m"}'::jsonb)
+ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data, email = EXCLUDED.email;
+
+INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, password_hash, data)
+VALUES
+  ('dm_rider_co_uk', 'r1', 'Porto Delivery Rider', '07700900111', 'rider@portopiripiri.co.uk', 'motorcycle', 'active', '$2a$10$Df2S2d7f7zMbx3l9XQEWQ.XNiP1fF2TQD7ibXKJF9cpRII1IZWgWa', '{"password_hash":"$2a$10$Df2S2d7f7zMbx3l9XQEWQ.XNiP1fF2TQD7ibXKJF9cpRII1IZWgWa","restaurant_name":"Porto Piri Piri","vehicle":"motorcycle","reg":"DEMO 01"}'::jsonb)
 ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, data = EXCLUDED.data, email = EXCLUDED.email;

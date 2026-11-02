@@ -1160,6 +1160,10 @@ router.post('/reset-password', asyncHandler(async (req, res) => {
     'UPDATE customers SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2',
     [passwordHash, emailNorm],
   );
+  await pool.query(
+    'UPDATE deliverymen SET password_hash = $1, data = jsonb_set(COALESCE(data, \'{}\'::jsonb), \'{password_hash}\', to_jsonb($1::text)), updated_at = NOW() WHERE LOWER(email) = $2',
+    [passwordHash, emailNorm],
+  );
 
   ok(res, {
     message: 'Password reset successfully. You may now log in with your new password.',
