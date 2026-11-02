@@ -915,6 +915,24 @@ CREATE TABLE IF NOT EXISTS deliveryman_requests (
   decided_by TEXT,
   decided_at TIMESTAMPTZ
 );
+
+-- Ensure all columns exist on deliveryman_requests if table already existed on server
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS branch_id TEXT;
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS deliveryman_id TEXT;
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS decided_by TEXT;
+ALTER TABLE deliveryman_requests ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'deliveryman_requests' AND column_name = 'status'
+  ) THEN
+    UPDATE deliveryman_requests SET state = status WHERE state IS NULL OR state = 'pending';
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_deliveryman_requests_scope ON deliveryman_requests (restaurant_id, branch_id, state);
 -- One open request per phone per restaurant: a repeat submission is refused, not queued twice.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_deliveryman_requests_pending_phone ON deliveryman_requests (restaurant_id, phone) WHERE state = 'pending';
@@ -937,6 +955,23 @@ CREATE TABLE IF NOT EXISTS delivery_reviews (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (restaurant_id, order_id)
 );
+
+-- Ensure all columns exist on delivery_reviews if table already existed on server
+ALTER TABLE delivery_reviews ADD COLUMN IF NOT EXISTS branch_id TEXT;
+ALTER TABLE delivery_reviews ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'visible';
+ALTER TABLE delivery_reviews ADD COLUMN IF NOT EXISTS hidden_reason TEXT;
+ALTER TABLE delivery_reviews ADD COLUMN IF NOT EXISTS hidden_by TEXT;
+ALTER TABLE delivery_reviews ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'delivery_reviews' AND column_name = 'status'
+  ) THEN
+    UPDATE delivery_reviews SET state = status WHERE state IS NULL OR state = 'visible';
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_delivery_reviews_scope ON delivery_reviews (restaurant_id, branch_id, state);
 CREATE INDEX IF NOT EXISTS idx_delivery_reviews_rider ON delivery_reviews (restaurant_id, deliveryman_id);
 
