@@ -169,19 +169,34 @@ router.post('/check-in', asyncHandler(async (req, res) => {
 }));
 
 router.post('/check-out', asyncHandler(async (req, res) => {
-  const { checkin_id, closing_counts } = req.body || {};
-  if (!checkin_id) throw badRequest('checkin_id required');
-  const { rows: curRows } = await pool.query(
-    'SELECT * FROM till_checkins WHERE id = $1 AND restaurant_id = $2',
-    [checkin_id, rid(req)],
-  );
-  if (!curRows[0]) throw notFound();
+  let { checkin_id, closing_counts } = req.body || {};
+  let curRows = [];
+  if (checkin_id) {
+    const { rows } = await pool.query(
+      'SELECT * FROM till_checkins WHERE id = $1 AND restaurant_id = $2',
+      [checkin_id, rid(req)],
+    );
+    curRows = rows;
+  }
+  // Fallback: if checkin_id not found or omitted, resolve the active open check-in for this till
+  if (!curRows[0]) {
+    const bound = tillId(req);
+    const { rows } = await pool.query(
+      `SELECT * FROM till_checkins 
+       WHERE restaurant_id = $1 ${bound ? 'AND till_id = $2' : ''} AND checked_out_at IS NULL 
+       ORDER BY checked_in_at DESC LIMIT 1`,
+      bound ? [rid(req), bound] : [rid(req)],
+    );
+    curRows = rows;
+  }
+  if (!curRows[0]) throw notFound('No active open till check-in found to check out');
+  const targetId = curRows[0].id;
   assertTillAccess(req, curRows[0].till_id);
   const { rows } = await pool.query(
     `UPDATE till_checkins SET checked_out_at = NOW(),
       data = COALESCE(data, '{}'::jsonb) || $3::jsonb
      WHERE id = $1 AND restaurant_id = $2 RETURNING *`,
-    [checkin_id, rid(req), { closing_counts: closing_counts || {} }],
+    [targetId, rid(req), { closing_counts: closing_counts || {} }],
   );
   if (!rows[0]) throw notFound();
   ok(res, rows[0]);
