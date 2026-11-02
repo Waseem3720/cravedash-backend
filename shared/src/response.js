@@ -10,13 +10,13 @@ function created(res, data) {
 
 function fail(res, err) {
   const status = err.status || 500;
-  return res.status(status).json({
-    success: false,
-    error: {
-      code: err.code || 'INTERNAL_ERROR',
-      message: err.message || 'Internal server error',
-    },
-  });
+  const error = {
+    code: err.code || 'INTERNAL_ERROR',
+    message: err.message || 'Internal server error',
+  };
+  // Structured detail for refusals such as 409 dependants (SEC-M8). Only set by the server, never echoed input.
+  if (err.details !== undefined) error.details = err.details;
+  return res.status(status).json({ success: false, error });
 }
 
 module.exports = { ok, created, fail };

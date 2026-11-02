@@ -3,7 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 const { createApp } = require('@cravedash/shared/src/createApp');
 const { listenHost } = require('@cravedash/shared/src/listenHost');
-const { requireAuth, requireRole, optionalAuth } = require('@cravedash/shared/src/authMiddleware');
+const { requireAuth, requireRole } = require('@cravedash/shared/src/authMiddleware');
 const { forbidden } = require('@cravedash/shared/src/errors');
 const platform = require('./routes/platform');
 const { stripeWebhookHandler } = require('./routes/stripeOps');
@@ -28,6 +28,10 @@ function platformGate(req, res, next) {
   const p = req.path || '';
 
   if (role === 'restaurant' || role === 'epos') {
+    // Subscription plan prices are for restaurant admins; a till never needs them.
+    if (role === 'epos' && /^\/plans(\/|$)/.test(p)) {
+      return next(forbidden('EPOS cannot read subscription plans'));
+    }
     if (/^\/plans(\/|$)/.test(p)) {
       if (method === 'GET') return next();
       return next(forbidden('Plans are read-only for restaurants'));
@@ -41,6 +45,8 @@ function platformGate(req, res, next) {
     }
     // Payout requests: restaurant can list own + create requested (scoped in handler)
     if (/^\/payouts(\/|$)/.test(p)) {
+      // BUG-028: a branch login is not the restaurant owner and cannot request a payout. Owners (no branch) keep their access.
+      if (method === 'POST' && req.user?.branch_id) return next(forbidden('Branch logins cannot create payouts'));
       if (method === 'GET' || method === 'POST') return next();
       return next(forbidden('Only platform admins can update payouts'));
     }
@@ -61,21 +67,11 @@ function platformGate(req, res, next) {
 // Stripe webhook: no JWT; signature verified inside handler (rawBody via createApp)
 app.post('/api/v1/stripe/webhook', stripeWebhookHandler);
 
-// Public / Chef support inquiry contact endpoint
-app.post(['/api/v1/support/contact', '/api/v1/support-tickets/contact'], optionalAuth, platform.handleSupportContact);
-
 app.use('/api/v1', requireAuth, platformGate, platform);
 
-// Post-mount error handler converting uncaught errors to standard JSON
-const { fail } = require('@cravedash/shared/src/response');
-const { AppError } = require('@cravedash/shared/src/errors');
-app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  if (!(err instanceof AppError)) {
-    console.error('[platform-service]', err);
-    err = new AppError(err.message || 'Internal error', 500, 'INTERNAL_ERROR');
-  }
-  fail(res, err);
+app.listen(PORT, HOST, () => {
+  console.log(`Platform service on http://${HOST}:${PORT}`);
+  require('@cravedash/shared/src/db').warmPool();
 });
 
 /**
@@ -110,11 +106,4 @@ function startHeldPayoutCron() {
   console.log(`[stripe] held-payout cron every ${Math.round(intervalMs / 1000)}s`);
 }
 
-if (require.main === module) {
-  app.listen(PORT, HOST, () => {
-    console.log(`Platform service on http://${HOST}:${PORT}`);
-  });
-  startHeldPayoutCron();
-}
-
-module.exports = app;
+startHeldPayoutCron();

@@ -1,11 +1,25 @@
 const pool = require('../db');
 
-/**
- * Canonical schema provisioning handled by Migration 009 (CD-CON-058).
- * Retained as no-op to preserve function signature for callers.
- */
 async function ensureDomainTables() {
-  return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS domain_docs (
+      restaurant_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      collection TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (restaurant_id, domain, collection)
+    );
+    CREATE TABLE IF NOT EXISTS domain_rows (
+      restaurant_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      collection TEXT NOT NULL,
+      id TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (restaurant_id, domain, collection, id)
+    );
+  `);
 }
 
 async function readDoc(restaurantId, domain, collection, fallback = []) {

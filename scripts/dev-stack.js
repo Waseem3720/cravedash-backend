@@ -1,7 +1,6 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const net = require('net');
-const fs = require('fs');
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
@@ -61,24 +60,31 @@ async function main() {
     });
     m.on('exit', (c) => (c === 0 ? resolve() : reject(new Error('migrate failed'))));
   });
-  await new Promise((resolve, reject) => {
-    const s = spawn(process.execPath, [path.join(root, 'scripts/seed-full.js')], {
-      cwd: root,
-      env: process.env,
-      stdio: 'inherit',
+  // BUG-029: demo seeding is no longer automatic on every start (it reset demo passwords and plan prices each time).
+  // Run `npm run seed` for demo data, or set DEV_STACK_SEED=1 to seed as part of this start.
+  if (process.env.DEV_STACK_SEED === '1') {
+    await new Promise((resolve, reject) => {
+      const s = spawn(process.execPath, [path.join(root, 'scripts/seed-full.js')], {
+        cwd: root,
+        env: process.env,
+        stdio: 'inherit',
+      });
+      s.on('exit', (c) => (c === 0 ? resolve() : reject(new Error('seed failed'))));
     });
-    s.on('exit', (c) => (c === 0 ? resolve() : reject(new Error('seed failed'))));
-  });
+  } else {
+    console.log('[stack] Demo seed skipped. Run `npm run seed` to load demo data, or set DEV_STACK_SEED=1.');
+  }
 
   // API services
   require('./dev-all.js');
 
-  // Frontend (spawn only if directory exists)
+  // Frontend (if present)
+  const fs = require('fs');
   if (fs.existsSync(path.join(root, 'frontend'))) {
     const fe = spawn(
       process.platform === 'win32' ? 'npm.cmd' : 'npm',
       ['run', 'dev', '--prefix', 'frontend'],
-      { cwd: root, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] },
+      { cwd: root, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' },
     );
     fe.stdout.on('data', (d) => process.stdout.write(`[frontend] ${d}`));
     fe.stderr.on('data', (d) => process.stderr.write(`[frontend] ${d}`));

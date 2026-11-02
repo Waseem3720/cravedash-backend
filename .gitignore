@@ -1,9 +1,17 @@
-node_modules/
-.pgdata/
-pgdata/
+Old deployment files/
+node_modules
 .env
 .env.*
 !.env.example
+.pgdata
+pgdata
 *.log
-.DS_Store
+logs
+coverage
+.nyc_output
+.vscode
+.idea
 *.pid
+*.pid.lock
+.DS_Store
+Thumbs.db

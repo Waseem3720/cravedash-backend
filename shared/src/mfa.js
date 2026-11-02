@@ -1,10 +1,20 @@
 /**
  * TOTP helpers for super-admin MFA (RFC 6238).
  * Uses Node crypto — no mandatory third-party TOTP package.
+ *
+ * SEC-M3 / SEC-M5 additions:
+ *   - matchTotpStep() returns the matched time-step counter so the caller can refuse a replay.
+ *   - claimTotpStep() records the accepted step per account (in-process; see note below).
+ *   - Backup codes are stored with bcrypt (salted). Legacy unsalted SHA-256 entries are still accepted
+ *     by matchBackupCode() so existing rows keep working until each code is used.
  */
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const BCRYPT_ROUNDS = 10;
+const LEGACY_HASH_RE = /^[a-f0-9]{64}$/;
+const BCRYPT_RE = /^\$2[aby]\$\d{2}\$/;
 
 function toBase32(buf) {
   let bits = 0;
@@ -62,15 +72,44 @@ function totp(secretBase32, { step = 30, t = Date.now() } = {}) {
   return hotp(secretBase32, counter);
 }
 
-function verifyTotp(secretBase32, token, { window = 1, step = 30 } = {}) {
+/**
+ * Returns the time-step counter that the 6-digit code matches inside the accepted window, or null.
+ * The comparison runs over the whole window so timing does not reveal which step matched.
+ */
+function matchTotpStep(secretBase32, token, { window = 1, step = 30, t = Date.now() } = {}) {
   const code = String(token || '').replace(/\s+/g, '');
-  if (!/^\d{6}$/.test(code)) return false;
-  const now = Date.now();
+  if (!/^\d{6}$/.test(code)) return null;
+  const base = Math.floor(t / 1000 / step);
+  let matched = null;
   for (let w = -window; w <= window; w++) {
-    const candidate = totp(secretBase32, { step, t: now + w * step * 1000 });
-    if (crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(code))) return true;
+    const counter = base + w;
+    const candidate = hotp(secretBase32, counter);
+    if (crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(code))) matched = counter;
   }
-  return false;
+  return matched;
+}
+
+function verifyTotp(secretBase32, token, { window = 1, step = 30 } = {}) {
+  return matchTotpStep(secretBase32, token, { window, step }) !== null;
+}
+
+/**
+ * Replay guard (SEC-M3). Accepts a step only once per account: a step that is not later than the last accepted
+ * step is refused. State lives in this process; a multi-instance deployment needs a shared store.
+ */
+const acceptedSteps = new Map();
+const STEP_TTL_MS = 5 * 60 * 1000;
+
+function claimTotpStep(accountId, step) {
+  const now = Date.now();
+  for (const [k, v] of acceptedSteps) {
+    if (v.exp < now) acceptedSteps.delete(k);
+  }
+  const key = String(accountId);
+  const last = acceptedSteps.get(key);
+  if (last && step <= last.step) return false;
+  acceptedSteps.set(key, { step, exp: now + STEP_TTL_MS });
+  return true;
 }
 
 function otpauthUrl({ secret, email, issuer = 'CraveDash' }) {
@@ -85,8 +124,42 @@ function otpauthUrl({ secret, email, issuer = 'CraveDash' }) {
   return `otpauth://totp/${label}?${params.toString()}`;
 }
 
+/** Legacy unsalted SHA-256. Kept only to verify rows written before SEC-M5. Do not use for new codes. */
 function hashBackupCode(code) {
   return crypto.createHash('sha256').update(String(code).toUpperCase()).digest('hex');
+}
+
+/** Salted bcrypt hash for a new backup code. */
+function hashBackupCodeSecure(code) {
+  return bcrypt.hash(String(code).toUpperCase(), BCRYPT_ROUNDS);
+}
+
+/**
+ * Finds the stored entry that matches the code. Returns its index, or -1.
+ * Accepts both bcrypt entries and legacy SHA-256 entries.
+ */
+async function matchBackupCode(code, entries, { acceptLegacy = true } = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  const plain = String(code || '').toUpperCase();
+  for (let i = 0; i < list.length; i++) {
+    const entry = String(list[i] || '');
+    if (BCRYPT_RE.test(entry)) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await bcrypt.compare(plain, entry)) return i;
+    } else if (LEGACY_HASH_RE.test(entry) && acceptLegacy) {
+      const legacy = hashBackupCode(plain);
+      if (crypto.timingSafeEqual(Buffer.from(legacy), Buffer.from(entry))) return i;
+    }
+  }
+  return -1;
+}
+
+function hasLegacyBackupEntries(entries) {
+  return (Array.isArray(entries) ? entries : []).some((e) => LEGACY_HASH_RE.test(String(e || '')));
+}
+
+function isLegacyBackupEntry(entry) {
+  return LEGACY_HASH_RE.test(String(entry || ''));
 }
 
 function generateBackupCodes(n = 8) {
@@ -101,7 +174,13 @@ module.exports = {
   generateSecret,
   totp,
   verifyTotp,
+  matchTotpStep,
+  claimTotpStep,
   otpauthUrl,
   hashBackupCode,
+  hashBackupCodeSecure,
+  matchBackupCode,
+  isLegacyBackupEntry,
+  hasLegacyBackupEntries,
   generateBackupCodes,
 };

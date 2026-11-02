@@ -24,7 +24,7 @@ x-service-defaults: &service-defaults
   build: .
   restart: unless-stopped
   env_file: .env
-  networks: [cravedash]
+  networks: [ cravedash ]
   depends_on:
     postgres:
       condition: service_healthy
@@ -46,33 +46,33 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}" ]
       interval: 5s
       timeout: 5s
       retries: 15
-    networks: [cravedash]
+    networks: [ cravedash ]
 
   # ----------------------------------------------------------------------------
   # Database Migrations (Runs sequentially once on boot, then terminates)
   # ----------------------------------------------------------------------------
   migrate:
     build: .
-    command: ["node", "shared/scripts/migrate.js"]
+    command: [ "node", "shared/scripts/migrate.js" ]
     restart: "no"
     env_file: .env
     environment: *common-env
     depends_on:
       postgres:
         condition: service_healthy
-    networks: [cravedash]
+    networks: [ cravedash ]
 
   # ----------------------------------------------------------------------------
   # Optional Demo / Initial Seed (Runs only when explicitly requested)
   # ----------------------------------------------------------------------------
   seed:
     build: .
-    profiles: ["seed"]
-    command: ["node", "scripts/seed-full.js"]
+    profiles: [ "seed" ]
+    command: [ "node", "scripts/seed-full.js" ]
     restart: "no"
     env_file: .env
     environment:
@@ -81,14 +81,14 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [cravedash]
+    networks: [ cravedash ]
 
   # ----------------------------------------------------------------------------
   # API Gateway (Public edge proxy; bound only to loopback port 4100 on host)
   # ----------------------------------------------------------------------------
   gateway:
     build: .
-    command: ["node", "services/gateway/src/index.js"]
+    command: [ "node", "services/gateway/src/index.js" ]
     restart: unless-stopped
     env_file: .env
     environment:
@@ -122,61 +122,61 @@ services:
       reporting:
         condition: service_started
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:4000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      test: [ "CMD", "node", "-e", "require('http').get('http://127.0.0.1:4000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))" ]
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 10s
-    networks: [cravedash]
+    networks: [ cravedash ]
 
   # ----------------------------------------------------------------------------
   # Internal Backend Microservices
   # ----------------------------------------------------------------------------
   auth:
     <<: *service-defaults
-    command: ["node", "services/auth-service/src/index.js"]
+    command: [ "node", "services/auth-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4001
 
   catalog:
     <<: *service-defaults
-    command: ["node", "services/catalog-service/src/index.js"]
+    command: [ "node", "services/catalog-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4002
 
   order:
     <<: *service-defaults
-    command: ["node", "services/order-service/src/index.js"]
+    command: [ "node", "services/order-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4003
 
   restaurant:
     <<: *service-defaults
-    command: ["node", "services/restaurant-service/src/index.js"]
+    command: [ "node", "services/restaurant-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4004
 
   platform:
     <<: *service-defaults
-    command: ["node", "services/platform-service/src/index.js"]
+    command: [ "node", "services/platform-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4005
 
   epos:
     <<: *service-defaults
-    command: ["node", "services/epos-service/src/index.js"]
+    command: [ "node", "services/epos-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4006
 
   reporting:
     <<: *service-defaults
-    command: ["node", "services/reporting-service/src/index.js"]
+    command: [ "node", "services/reporting-service/src/index.js" ]
     environment:
       <<: *service-env
       PORT: 4007

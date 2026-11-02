@@ -22,7 +22,8 @@
     "dev:epos": "node services/epos-service/src/index.js",
     "dev:reporting": "node services/reporting-service/src/index.js",
     "dev:frontend": "npm --prefix frontend run dev",
-    "dev:all": "node scripts/dev-stack.js"
+    "dev:all": "node scripts/dev-stack.js",
+    "test": "node --test --test-concurrency=1 \"tests/*.test.js\""
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

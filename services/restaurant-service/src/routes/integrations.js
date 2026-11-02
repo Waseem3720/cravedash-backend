@@ -1,16 +1,14 @@
 const express = require('express');
 const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
 const pool = require('@cravedash/shared/src/db');
 const { ok, created } = require('@cravedash/shared/src/response');
 const asyncHandler = require('@cravedash/shared/src/asyncHandler');
-const { restaurantId } = require('@cravedash/shared/src/authMiddleware');
+const { restaurantId, tillId, branchId } = require('@cravedash/shared/src/authMiddleware');
 const { badRequest, forbidden, unauthorized, notFound } = require('@cravedash/shared/src/errors');
 const {
   encryptSecret,
   decryptSecret,
   isEncrypted,
-  maskSecret,
   decryptKeysObject,
 } = require('@cravedash/shared/src/secretsCrypto');
 const {
@@ -51,105 +49,42 @@ async function saveIntegrations(restaurantId, data) {
   return rows[0].data;
 }
 
-function sanitizeProviderError(err, providerId) {
-  if (!err) return 'Provider connection test failed';
-  const rawMsg = typeof err === 'string' ? err : (err.message || String(err));
-  const idLabel = providerId ? `Provider (${providerId})` : 'Provider';
+/** Placeholder for any stored secret. It is the same length for every value, so no part of a secret is shown (SEC-M19). */
+const REDACTED = '••••••••';
+const SECRET_KEY_RE = /secret|token|password|private_key|api_key|auth_token|server_key/i;
 
-  // 1. Categorize known network / protocol failures
-  if (/timeout|etimedout|esockettimedout/i.test(rawMsg)) {
-    return `${idLabel} connection timed out`;
-  }
-  if (/econnrefused|econnreset|ehostunreach|enotfound|getaddrinfo/i.test(rawMsg)) {
-    return `${idLabel} network endpoint unreachable or connection refused`;
-  }
-
-  // 2. Categorize HTTP status and authentication failures
-  if (/401|unauthorized|invalid[_\s-]?credentials|invalid[_\s-]?api[_\s-]?key|auth failed|authentication failed|bad credentials|invalid_client/i.test(rawMsg)) {
-    return `${idLabel} authentication failed (invalid credentials or unauthorized)`;
-  }
-  if (/403|forbidden|permission denied|access denied/i.test(rawMsg)) {
-    return `${idLabel} access forbidden (insufficient permissions)`;
-  }
-  if (/404|not found/i.test(rawMsg)) {
-    return `${idLabel} resource or endpoint not found (404)`;
-  }
-  if (/429|rate limit|too many requests/i.test(rawMsg)) {
-    return `${idLabel} rate limit exceeded (429)`;
-  }
-  if (/5\d\d|internal server error|bad gateway|service unavailable/i.test(rawMsg)) {
-    return `${idLabel} remote service returned a server error`;
-  }
-
-  // 3. Fallback: redact URLs, connection strings, auth headers, and credential query params
-  let cleaned = rawMsg
-    .replace(/https?:\/\/[^\s]+/gi, '[URL_REDACTED]')
-    .replace(/[a-z0-9_+-]+:\/\/[^\s]+/gi, '[URI_REDACTED]')
-    .replace(/(bearer|basic|token|key|secret|password|auth|authorization|cred|credential)[:=\s]+[^\s,;&]+/gi, '$1=[REDACTED]')
-    .replace(/([?&][a-zA-Z0-9_-]*(?:secret|key|token|auth|pass|pwd)[a-zA-Z0-9_-]*=)[^&\s]+/gi, '$1[REDACTED]')
-    .trim();
-
-  // If long or contains high-entropy token-like strings, return safe generic message
-  if (/[a-zA-Z0-9_-]{25,}/.test(cleaned) || cleaned.length > 150) {
-    return `${idLabel} connection test failed`;
-  }
-
-  return cleaned || `${idLabel} connection test failed`;
-}
-
-function safeTimingCompare(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-function verifyTwilioSignature(authToken, expectedSig, url, params = {}) {
-  if (!authToken || !expectedSig || !url) return false;
-  let data = url;
-  if (params && typeof params === 'object') {
-    const keys = Object.keys(params).sort();
-    for (const k of keys) {
-      data += k + (params[k] ?? '');
-    }
-  }
-  const computed = crypto.createHmac('sha1', authToken).update(Buffer.from(data, 'utf8')).digest('base64');
-  return safeTimingCompare(computed, expectedSig);
-}
-
+/**
+ * Integration entry as shown in any response. Every key that is a known secret field or secret-like by name is replaced
+ * by a fixed placeholder (no tail of the value), and the raw provider test result is dropped. The error text of a
+ * failed test is kept, since it is needed to fix the connection.
+ */
 function maskIntegrationEntry(id, entry) {
   const e = entry && typeof entry === 'object' ? { ...entry } : {};
-  const keys = { ...(e.keys || {}) };
-  for (const f of secretFieldsFor(id)) {
-    if (keys[f]) keys[f] = maskSecret(isEncrypted(keys[f]) ? '••••••••' + String(keys[f]).slice(-4) : keys[f]);
-  }
-  // also mask any field named like secret
-  for (const [k, v] of Object.entries(keys)) {
-    if (/secret|token|password|private_key|api_key|auth_token|server_key|access_token|client_secret|webhook_secret/i.test(k) && v && !String(v).startsWith('••••')) {
-      keys[k] = maskSecret(isEncrypted(v) ? '••••••••' + String(v).slice(-4) : v);
-    }
+  const secretNames = new Set(secretFieldsFor(id));
+  const keys = {};
+  for (const [k, v] of Object.entries(e.keys || {})) {
+    const isSecret = secretNames.has(k) || SECRET_KEY_RE.test(k);
+    keys[k] = isSecret ? (v ? REDACTED : '') : v;
   }
   e.keys = keys;
   e.has_secrets = secretFieldsFor(id).some((f) => !!(entry && entry.keys && entry.keys[f]));
+  if (e.last_test && typeof e.last_test === 'object') {
+    const { result, ...lastTest } = e.last_test;
+    e.last_test = lastTest;
+  }
   e.tested_ok = !!(e.last_test && e.last_test.ok);
   return e;
 }
 
-function mergeKeys(existing, incoming, providerId, keysToRemove = []) {
+function mergeKeys(existing, incoming, providerId) {
   const out = { ...(existing || {}) };
-  for (const f of keysToRemove) {
-    delete out[f];
-  }
   const secrets = new Set(secretFieldsFor(providerId));
   for (const [k, v] of Object.entries(incoming || {})) {
-    if (k === 'keys_to_remove' || k === 'remove_keys' || k === 'enabled') continue;
-    if (keysToRemove.includes(k)) continue;
     if (v == null) continue;
     const s = String(v).trim();
     if (!s) continue;
     if (s.startsWith('••••')) continue; // keep existing
-    if (secrets.has(k) || /secret|token|password|private_key|auth_token|server_key|api_key|client_secret|access_token|webhook_secret/i.test(k)) {
+    if (secrets.has(k) || /secret|token|password|private_key|auth_token|server_key/i.test(k)) {
       out[k] = encryptSecret(s);
     } else {
       out[k] = s;
@@ -164,6 +99,8 @@ function decryptedKeys(entry, providerId) {
 
 // GET /integrations — masked status for all providers
 router.get('/integrations', asyncHandler(async (req, res) => {
+  // Admin only: the till (EPOS) session never reads integration settings (SEC-M19).
+  requireIntegrationAdmin(req);
   const all = await loadIntegrations(rid(req));
   const out = {};
   for (const [id, entry] of Object.entries(all)) {
@@ -172,31 +109,33 @@ router.get('/integrations', asyncHandler(async (req, res) => {
   ok(res, out);
 }));
 
-// PUT /integrations/:provider — save keys (encrypt secrets, support keys_to_remove)
+/**
+ * Integration credentials, settings and provider tests: restaurant admin or super only (decision D2).
+ * Enforced here, not only by the EPOS guard, so a route cannot be opened by changing the guard.
+ */
+function requireIntegrationAdmin(req) {
+  const role = req.user?.role;
+  // P1: a branch login (branch_id set on the account) must not read or change restaurant-wide credentials.
+  // An owner viewing a branch (X-Branch-Context also sets branch_id) is refused here too, because these settings are restaurant-wide.
+  if ((role !== 'restaurant' && role !== 'super') || req.user?.till_id || req.user?.branch_id) {
+    throw forbidden('Only a restaurant administrator can view or change integration settings');
+  }
+}
+
+// PUT /integrations/:provider — save keys (encrypt secrets)
 router.put('/integrations/:provider', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const id = String(req.params.provider || '');
   if (!getProvider(id) && id !== 'stripe') throw badRequest(`Unknown provider: ${id}`);
   const all = await loadIntegrations(rid(req));
   const prev = all[id] || {};
   const body = req.body || {};
-
-  // Validate keys_to_remove if provided
-  const keysToRemove = body.keys_to_remove || body.remove_keys || [];
-  if (!Array.isArray(keysToRemove)) {
-    throw badRequest('keys_to_remove must be an array of field names');
-  }
-  for (const f of keysToRemove) {
-    if (typeof f !== 'string' || !/^[a-zA-Z0-9_]{1,64}$/.test(f)) {
-      throw badRequest(`Invalid field name in keys_to_remove: ${f}`);
-    }
-  }
-
-  const incomingKeys = body.keys && typeof body.keys === 'object' ? body.keys : body;
-  const keys = mergeKeys(prev.keys, incomingKeys, id, keysToRemove);
+  // clear_keys removes every saved key (Remove keys); otherwise the keys are merged and empty values are kept.
+  const keys = body.clear_keys ? {} : mergeKeys(prev.keys, body.keys || body, id);
   const next = {
     ...prev,
     keys,
-    enabled: body.enabled !== undefined ? !!body.enabled : (prev.enabled !== undefined ? prev.enabled : true),
+    enabled: body.enabled !== undefined ? !!body.enabled : true,
     updated_at: new Date().toISOString(),
     updated_by: req.user?.email || req.user?.sub || null,
   };
@@ -206,7 +145,10 @@ router.put('/integrations/:provider', asyncHandler(async (req, res) => {
 }));
 
 // POST /integrations/:provider/test — real provider test
-router.post('/integrations/:provider/test', asyncHandler(async (req, res) => {
+router.post('/integrations/:provider/test', asyncHandler(async (req, res, next) => {
+  // 'payment' has its own route below; let it through so that route answers (FE-H5).
+  if (req.params.provider === 'payment') return next();
+  requireIntegrationAdmin(req);
   const id = String(req.params.provider || '');
   const provider = getProvider(id);
   if (!provider || typeof provider.testConnection !== 'function') {
@@ -234,18 +176,18 @@ router.post('/integrations/:provider/test', asyncHandler(async (req, res) => {
     await saveIntegrations(rid(req), all);
     ok(res, { ok: true, provider: id, result });
   } catch (err) {
-    const safeError = sanitizeProviderError(err, id);
     all[id] = {
       ...entry,
-      last_test: { ok: false, at: new Date().toISOString(), error: safeError },
+      last_test: { ok: false, at: new Date().toISOString(), error: err.message },
     };
     await saveIntegrations(rid(req), all);
-    throw badRequest(safeError);
+    throw badRequest(err.message || 'Connection test failed');
   }
 }));
 
 // POST /notifications/sms
 router.post('/notifications/sms', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const { to, body, message } = req.body || {};
   const all = await loadIntegrations(rid(req));
   const entry = all.sms;
@@ -257,6 +199,7 @@ router.post('/notifications/sms', asyncHandler(async (req, res) => {
 
 // POST /notifications/email
 router.post('/notifications/email', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const { to, subject, text, html } = req.body || {};
   const all = await loadIntegrations(rid(req));
   const entry = all.smtp;
@@ -268,15 +211,17 @@ router.post('/notifications/email', asyncHandler(async (req, res) => {
 
 // POST /notifications/push
 router.post('/notifications/push', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const { title, body, tokens, topic, data } = req.body || {};
   const all = await loadIntegrations(rid(req));
   const entry = all.firebase;
   if (!entry?.enabled) throw badRequest('Firebase push is not enabled');
   const keys = decryptedKeys(entry, 'firebase');
-  // Also pull service account from settings_firebase-config blob if present
+  // Service account lives in the Firebase settings blob. Blob keys use underscores (the API rejects hyphens),
+  // so the canonical key is settings_firebase_config; the legacy hyphenated key is still read as a fallback.
   const { rows } = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [rid(req), 'settings_firebase-config'],
+    'SELECT key, data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = ANY($2::text[]) ORDER BY key = $3 DESC LIMIT 1',
+    [rid(req), ['settings_firebase_config', 'settings_firebase-config'], 'settings_firebase_config'],
   );
   const cfg = rows[0]?.data;
   if (cfg && typeof cfg === 'object') {
@@ -299,6 +244,7 @@ router.post('/notifications/push', asyncHandler(async (req, res) => {
 
 // POST /notifications/whatsapp
 router.post('/notifications/whatsapp', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const { to, text, template, language } = req.body || {};
   const all = await loadIntegrations(rid(req));
   const entry = all.whatsapp;
@@ -310,6 +256,7 @@ router.post('/notifications/whatsapp', asyncHandler(async (req, res) => {
 
 // POST /integrations/maps/geocode
 router.post('/integrations/maps/geocode', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const all = await loadIntegrations(rid(req));
   const entry = all.maps;
   if (!entry?.enabled) throw badRequest('Google Maps is not enabled');
@@ -320,6 +267,7 @@ router.post('/integrations/maps/geocode', asyncHandler(async (req, res) => {
 
 // POST /integrations/postcode/lookup
 router.post('/integrations/postcode/lookup', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const all = await loadIntegrations(rid(req));
   const entry = all.postcode;
   if (!entry?.enabled) throw badRequest('Postcode lookup is not enabled');
@@ -330,6 +278,7 @@ router.post('/integrations/postcode/lookup', asyncHandler(async (req, res) => {
 
 // --- Payment API connect (billing / terminal) ---
 router.post('/integrations/payment/test', asyncHandler(async (req, res) => {
+  requireIntegrationAdmin(req);
   const { kind, provider, keys } = req.body || {};
   const map = kind === 'terminal' ? terminalProviders.TERMINAL : terminalProviders.BILLING;
   const p = map[provider];
@@ -343,8 +292,17 @@ router.post('/integrations/payment/test', asyncHandler(async (req, res) => {
 }));
 
 // --- Print jobs & cash drawer ---
-async function loadPrinters(restaurantId) {
-  // domain_docs ops/printers preferred; provisioned canonically by Migration 009
+async function loadPrinters(restaurantId, branch = null) {
+  if (branch) {
+    // A branch prints on its own printers only (the branch's ops/printers copy).
+    const { rows } = await pool.query(
+      'SELECT data FROM branch_settings WHERE restaurant_id = $1 AND branch_id = $2 AND key = $3',
+      [restaurantId, branch, 'dom:ops:printers'],
+    );
+    const d = rows[0]?.data;
+    return Array.isArray(d) ? d : (d?.items || d?.printers || []);
+  }
+  // domain_docs ops/printers preferred. The table is created by scripts/init-db.sql (migrate), not here.
   try {
     const { rows } = await pool.query(
       `SELECT data FROM domain_docs WHERE restaurant_id = $1 AND domain = 'ops' AND collection = 'printers' LIMIT 1`,
@@ -360,15 +318,28 @@ async function loadPrinters(restaurantId) {
   return [];
 }
 
-async function appendPrintLog(restaurantId, entry) {
-  const { rows } = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [restaurantId, 'print_log'],
-  );
+/** The branch a print job belongs to: the caller's own branch, or NULL for the restaurant. */
+function printBranch(req) {
+  return branchId(req) || null;
+}
+
+async function appendPrintLog(restaurantId, entry, branch = null) {
+  const { rows } = branch
+    ? await pool.query('SELECT data FROM branch_settings WHERE restaurant_id = $1 AND branch_id = $2 AND key = $3', [restaurantId, branch, 'print_log'])
+    : await pool.query('SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2', [restaurantId, 'print_log']);
   let log = rows[0]?.data;
   if (!Array.isArray(log)) log = [];
   log.unshift(entry);
   log = log.slice(0, 100);
+  if (branch) {
+    await pool.query(
+      `INSERT INTO branch_settings (restaurant_id, branch_id, key, data, updated_at)
+       VALUES ($1, $2, 'print_log', $3::jsonb, NOW())
+       ON CONFLICT (restaurant_id, branch_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+      [restaurantId, branch, JSON.stringify(log)],
+    );
+    return;
+  }
   await pool.query(
     `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
      VALUES ($1, 'print_log', $2::jsonb, NOW())
@@ -377,71 +348,92 @@ async function appendPrintLog(restaurantId, entry) {
   );
 }
 
+/** Print queue rows (SEC-M17). The print_jobs table is created by scripts/init-db.sql, not here. */
+async function enqueuePrintJob(restaurantId, job, payloadB64, branch = null) {
+  await pool.query(
+    `INSERT INTO print_jobs (id, restaurant_id, status, payload, payload_b64, branch_id) VALUES ($1, $2, 'queued', $3::jsonb, $4, $5)`,
+    [job.id, restaurantId, JSON.stringify(job), payloadB64, branch],
+  );
+}
+
+/** Private LAN IPv4 addresses for network printers (SEC-M17). Loopback is 127.0.0.1 only. */
+const PRIVATE_LAN_RE = [
+  /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
+  /^192\.168\.\d{1,3}\.\d{1,3}$/,
+  /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/,
+];
+
+/** Host part of a printer address (the port, if any, is dropped). */
+function printerHost(address) {
+  return String(address || '').trim().replace(/:\d+$/, '');
+}
+
+function looksLikeIpv4(host) {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+  return host.split('.').every((octet) => Number(octet) <= 255);
+}
+
+function isLanPrinterAddress(address) {
+  const host = printerHost(address);
+  if (!looksLikeIpv4(host)) return false;
+  if (host === '127.0.0.1') return true;
+  return PRIVATE_LAN_RE.some((re) => re.test(host) && looksLikeIpv4(host));
+}
+
+function isNetworkPrinter(printer) {
+  return !!printer && (printer.connection === 'network' || looksLikeIpv4(printerHost(printer.address)));
+}
+
+/** Addresses the super admin has explicitly allowed for network printers outside the LAN (SEC-M17). */
+async function printerAllowlist(restaurantId) {
+  const { rows } = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [restaurantId, 'printer_allowlist'],
+  );
+  return Array.isArray(rows[0]?.data) ? rows[0].data.map((a) => printerHost(a)) : [];
+}
+
+/**
+ * A network printer address must be a private LAN address, unless the super admin has allowed that exact address.
+ * Anything else (public address, hostname) is refused before a job or a drawer kick is sent.
+ */
+async function assertPrinterAddress(req, printer) {
+  if (!isNetworkPrinter(printer)) return;
+  if (isLanPrinterAddress(printer.address)) return;
+  const allowed = await printerAllowlist(rid(req));
+  if (looksLikeIpv4(printerHost(printer.address)) && allowed.includes(printerHost(printer.address))) return;
+  throw forbidden('Network printer address must be on the LAN, or allowed by the super admin');
+}
+
+/** Atomic per-restaurant call number (SEC-M17). Continues from the legacy call_seq value on first use. */
+async function nextCallNumber(restaurantId) {
+  const seqRows = await pool.query(
+    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
+    [restaurantId, 'call_seq'],
+  );
+  const seed = (+(seqRows.rows[0]?.data) || 230) + 1;
+  const { rows } = await pool.query(
+    `INSERT INTO call_counters (restaurant_id, last_no) VALUES ($1, $2)
+     ON CONFLICT (restaurant_id) DO UPDATE SET last_no = call_counters.last_no + 1
+     RETURNING last_no`,
+    [restaurantId, seed],
+  );
+  return Number(rows[0].last_no);
+}
+
 router.post('/print/jobs', asyncHandler(async (req, res) => {
   const { printer_id, html, title, copies, drawer } = req.body || {};
-  const printers = await loadPrinters(rid(req));
-  const printer = printers.find((p) => p.id === printer_id) || printers.find((p) => p.role === 'receipt' && p.active !== false);
-  if (!printer) {
-    // Allow queueing a generic job so print-agent can still pick it up
-    const fallback = {
-      id: printer_id || 'pr-default',
-      name: 'Default',
-      role: 'receipt',
-      connection: 'usb',
-      address: 'USB',
-      cut: true,
-      drawer: !!drawer,
-      active: true,
-    };
-    const agentUrl = process.env.PRINT_AGENT_URL || '';
-    const job = {
-      id: 'pj_' + Date.now().toString(36),
-      title: title || 'Print',
-      html: html || '',
-      copies: Math.max(1, Math.min(5, +(copies || 1))),
-      drawer: !!drawer,
-      printer: fallback,
-      at: new Date().toISOString(),
-    };
-    if (agentUrl) {
-      const r = await fetch(String(agentUrl).replace(/\/$/, '') + '/print', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Print-Agent-Key': process.env.PRINT_AGENT_KEY || '',
-        },
-        body: JSON.stringify(job),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw badRequest(data.error || `Print agent failed (${r.status})`);
-      await appendPrintLog(rid(req), { ...job, via: 'agent', ok: true });
-      return ok(res, { ok: true, via: 'agent', job_id: job.id, result: data });
-    }
-    const { rows } = await pool.query(
-      'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-      [rid(req), 'print_queue'],
-    );
-    let q = Array.isArray(rows[0]?.data) ? rows[0].data : [];
-    q.push({
-      ...job,
-      status: 'queued',
-      payload_b64: encodeText(html || title || '', { cut: true, drawer: !!drawer }).toString('base64'),
-    });
-    q = q.slice(-50);
-    await pool.query(
-      `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
-       VALUES ($1, 'print_queue', $2::jsonb, NOW())
-       ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-      [rid(req), JSON.stringify(q)],
-    );
-    await appendPrintLog(rid(req), { ...job, via: 'queue', ok: true });
-    return ok(res, {
-      ok: true,
-      via: 'queue',
-      job_id: job.id,
-      hint: 'No printers in Admin yet — job queued for print-agent. Add printers under Till management.',
-    });
+  // A job that opens the drawer goes through the same policy and audit as /print/drawer (SEC-H12).
+  if (drawer) {
+    await assertDrawerAllowed(req, req.body || {});
+    await auditDrawerOpen(req, req.body || {}, printer_id);
   }
+  const printers = await loadPrinters(rid(req), printBranch(req));
+  const found = printers.find((p) => p.id === printer_id) || printers.find((p) => p.role === 'receipt' && p.active !== false);
+  // SEC-M15: there is no fake default printer. With no printer the job is queued unassigned (it is never reported as
+  // printed), and the queue keeps it until a printer is set up for it.
+  const printer = found || { id: printer_id || null, connection: 'none', cut: true };
+  if (found) await assertPrinterAddress(req, printer);
 
   const agentUrl = process.env.PRINT_AGENT_URL || '';
   const job = {
@@ -455,7 +447,7 @@ router.post('/print/jobs', asyncHandler(async (req, res) => {
   };
 
   // 1) Local print agent (USB / LAN bridge on the till PC)
-  if (agentUrl) {
+  if (agentUrl && found) {
     try {
       const r = await fetch(String(agentUrl).replace(/\/$/, '') + '/print', {
         method: 'POST',
@@ -467,119 +459,109 @@ router.post('/print/jobs', asyncHandler(async (req, res) => {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || `Print agent failed (${r.status})`);
-      await appendPrintLog(rid(req), { ...job, via: 'agent', ok: true });
+      await appendPrintLog(rid(req), { ...job, via: 'agent', ok: true }, printBranch(req));
       return ok(res, { ok: true, via: 'agent', job_id: job.id, result: data });
     } catch (err) {
-      // fall through to network ESC/POS
-      if (printer.connection !== 'network') throw badRequest(err.message || 'Print agent unreachable');
+      if (printer.connection !== 'network') {
+        console.error(`[print] agent failed: job=${job.id} error=${err.message}`);
+        throw badRequest(err.message || 'Print agent unreachable');
+      }
+      // A network printer falls through to direct ESC/POS below.
+      console.error(`[print] agent failed for network printer, trying direct: job=${job.id} error=${err.message}`);
     }
   }
 
-  // 2) Direct network ESC/POS from server (printer must be reachable from VPS — rare)
-  if (printer.connection === 'network' || /^\d+\.\d+\.\d+\.\d+/.test(String(printer.address || ''))) {
+  // 2) Direct network ESC/POS from the server. A failure is logged and reported; it is not queued as printed (SEC-M15).
+  if (isNetworkPrinter(printer)) {
     try {
       const result = await printNetwork(printer, html || title || ' ', { drawer });
-      await appendPrintLog(rid(req), { ...job, via: 'network', ok: true });
+      await appendPrintLog(rid(req), { ...job, via: 'network', ok: true }, printBranch(req));
       return ok(res, { ok: true, via: 'network', job_id: job.id, result });
     } catch (err) {
-      // Queue for print agent poll
+      console.error(`[print] network print failed: job=${job.id} printer=${printer.id} error=${err.message}`);
+      await appendPrintLog(rid(req), { ...job, via: 'network', ok: false, error: String(err.message || '').slice(0, 200) }, printBranch(req)).catch(() => {});
+      throw badRequest(`Network printer did not accept the job: ${err.message || 'connection failed'}`);
     }
   }
 
-  // 3) Queue for print agent to poll
-  const { rows } = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [rid(req), 'print_queue'],
-  );
-  let q = rows[0]?.data;
-  if (!Array.isArray(q)) q = [];
-  q.push({ ...job, status: 'queued', payload_b64: encodeText(html || title || '', { cut: printer.cut !== false, drawer }).toString('base64') });
-  q = q.slice(-50);
-  await pool.query(
-    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
-     VALUES ($1, 'print_queue', $2::jsonb, NOW())
-     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-    [rid(req), JSON.stringify(q)],
-  );
-  await appendPrintLog(rid(req), { ...job, via: 'queue', ok: true });
+  // 3) Queue for the print agent to claim (also the path for a job with no printer set up yet)
+  await enqueuePrintJob(rid(req), { ...job, status: 'queued' }, encodeText(html || title || '', { cut: printer.cut !== false, drawer }).toString('base64'), printBranch(req));
+  await appendPrintLog(rid(req), { ...job, via: 'queue', ok: true }, printBranch(req));
   ok(res, {
     ok: true,
     via: 'queue',
     job_id: job.id,
-    hint: 'Install print-agent on the till PC (USB printers) or set PRINT_AGENT_URL. Network printers need a reachable IP.',
+    printer_id: printer.id,
+    status: 'queued',
+    hint: found
+      ? 'Install print-agent on the till PC (USB printers) or set PRINT_AGENT_URL. Network printers need a reachable IP.'
+      : 'No printer is set up for this job yet. It is queued and will print once a printer is added under Till management.',
   });
 }));
 
+/** Super admin only: the printer addresses allowed outside the LAN (SEC-M17). */
+router.put('/print/allowlist', asyncHandler(async (req, res) => {
+  if (req.user?.role !== 'super') throw forbidden('Only the super admin can change the printer address allow-list');
+  const input = (req.body || {}).addresses;
+  if (!Array.isArray(input)) throw badRequest('addresses must be an array of IPv4 addresses');
+  const list = input.map((a) => printerHost(a)).filter((a) => looksLikeIpv4(a));
+  if (list.length !== input.length) throw badRequest('Every entry must be an IPv4 address');
+  await pool.query(
+    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
+     VALUES ($1, 'printer_allowlist', $2::jsonb, NOW())
+     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+    [rid(req), JSON.stringify(list.slice(0, 50))],
+  );
+  ok(res, { addresses: list.slice(0, 50) });
+}));
+
 /**
- * Helper to check if till staff row has manager / approval privileges
+ * Cash drawer (SEC-H12). Opens only from a till session or an admin session. A "no sale" open needs the PIN of a
+ * restaurant manager (can_approve). Every open is written to the audit log first, and if that write fails the drawer stays shut.
  */
-function isApproverStaff(row) {
-  if (!row) return false;
-  const data = row.data && typeof row.data === 'object' ? row.data : {};
-  return !!(data.can_approve || /manager|supervisor|owner|admin|head\s*chef/i.test(row.role || ''));
+async function assertDrawerAllowed(req, body) {
+  if (!tillId(req) && req.user?.role !== 'restaurant' && req.user?.role !== 'super') {
+    throw forbidden('The cash drawer opens only from a till or an admin session');
+  }
+  if (String(body.reason || '') === 'no_sale') {
+    // A single-use manager approval from the PIN verify route (drawer_no_sale). Consumed here, so it opens the drawer once.
+    const token = String(body.approval_token || '');
+    if (!token) throw forbidden('A manager approval is required to open the drawer for no sale');
+    const { rows } = await pool.query(
+      `UPDATE z_approvals SET status = 'consumed', consumed_at = NOW()
+        WHERE token_hash = $1 AND restaurant_id = $2 AND action = 'drawer_no_sale' AND status = 'issued' AND expires_at > NOW()
+        RETURNING id`,
+      [crypto.createHash('sha256').update(token).digest('hex'), rid(req)],
+    );
+    if (!rows[0]) throw forbidden('The manager approval is invalid, expired or already used');
+  }
+}
+
+async function auditDrawerOpen(req, body, printerId) {
+  await pool.query(
+    `INSERT INTO audit_events (id, actor, action, entity_type, entity_id, restaurant_id, detail, data)
+     VALUES ($1, $2, 'drawer.open', 'printer', $3, $4, $5, $6::jsonb)`,
+    [
+      `aud_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      req.user?.name || req.user?.sub || 'unknown',
+      String(printerId || ''),
+      rid(req),
+      String(body.reason || 'sale'),
+      JSON.stringify({ till_id: tillId(req) || null, role: req.user?.role || null }),
+    ],
+  );
 }
 
 router.post('/print/drawer', asyncHandler(async (req, res) => {
-  const rId = rid(req);
-  const user = req.user || {};
-  const { printer_id, pin, manager_pin, reason, staff_id } = req.body || {};
-  const candidatePin = pin || manager_pin;
-
-  // 1. Authorization check:
-  // - Platform super admin and restaurant owner/admin tokens have full permissions
-  // - Cashiers / EPOS till staff require 'no_sale' permission OR manager PIN verification
-  const isSuper = user.role === 'super' && !user.impersonating;
-  const isRestaurantAdmin = user.role === 'restaurant';
-
-  const perms = Array.isArray(user.permissions)
-    ? user.permissions
-    : (user.perms && typeof user.perms === 'object' ? Object.keys(user.perms) : []);
-
-  const hasNoSalePerm = perms.includes('no_sale')
-    || user.can_no_sale === true
-    || (user.perms && user.perms.no_sale === true)
-    || user.can_approve === true;
-
-  let verifiedApprover = null;
-
-  if (!isSuper && !isRestaurantAdmin && !hasNoSalePerm) {
-    if (!candidatePin) {
-      throw forbidden('Cash drawer kick requires no_sale permission or manager PIN verification');
-    }
-
-    if (!/^\d{4,8}$/.test(String(candidatePin))) {
-      throw forbidden('Invalid manager PIN');
-    }
-
-    const { rows: staffRows } = await pool.query(
-      'SELECT id, name, role, pin_hash, data FROM till_staff WHERE restaurant_id = $1 AND status = true',
-      [rId]
-    );
-
-    for (const staff of staffRows) {
-      if (!isApproverStaff(staff) || !staff.pin_hash) continue;
-      const matched = await bcrypt.compare(String(candidatePin), staff.pin_hash).catch(() => false);
-      if (matched) {
-        verifiedApprover = staff;
-        break;
-      }
-    }
-
-    if (!verifiedApprover) {
-      throw forbidden('Invalid manager PIN');
-    }
-  }
-
-  // 2. Hardware / Printer resolution
-  const printers = await loadPrinters(rId);
+  await assertDrawerAllowed(req, req.body || {});
+  const { printer_id } = req.body || {};
+  const printers = await loadPrinters(rid(req), printBranch(req));
   const printer = printers.find((p) => p.id === printer_id)
     || printers.find((p) => p.role === 'receipt' && p.drawer && p.active !== false)
     || printers.find((p) => p.role === 'receipt');
   if (!printer) throw badRequest('No receipt printer with cash drawer configured');
-
-  // 3. Execution (Print agent or TCP ESC/POS)
-  let executionResult = null;
-  let via = 'mock';
+  await assertPrinterAddress(req, printer);
+  await auditDrawerOpen(req, req.body || {}, printer.id);
 
   const agentUrl = process.env.PRINT_AGENT_URL || '';
   if (agentUrl) {
@@ -593,73 +575,63 @@ router.post('/print/drawer', asyncHandler(async (req, res) => {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw badRequest(data.error || 'Print agent drawer failed');
-    via = 'agent';
-    executionResult = data;
-  } else {
-    try {
-      executionResult = await openDrawerNetwork(printer);
-      via = 'network';
-    } catch (err) {
-      if (process.env.NODE_ENV === 'test' || process.env.DISPOSABLE_SANDBOX === 'true') {
-        via = 'test_simulation';
-        executionResult = { kicked: true, printer_id: printer.id };
-      } else {
-        throw badRequest(err.message + ' — run print-agent on the till for USB drawers');
-      }
-    }
+    return ok(res, { ok: true, via: 'agent', result: data });
   }
 
-  // 4. Log immutable audit trail in audit_events
-  const auditId = `ae_drawer_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const actor = user.name || user.email || user.sub || (staff_id ? `staff:${staff_id}` : 'epos_cashier');
-  await pool.query(
-    `INSERT INTO audit_events (id, actor, action, entity_type, entity_id, restaurant_id, detail, data, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW())`,
-    [
-      auditId,
-      actor,
-      'drawer_kick',
-      'printer',
-      printer.id || 'cash_drawer',
-      rId,
-      `Cash drawer kick executed (${verifiedApprover ? `manager approved by ${verifiedApprover.name}` : 'authorized session'})`,
-      JSON.stringify({
-        approver_id: verifiedApprover ? verifiedApprover.id : null,
-        approver_name: verifiedApprover ? verifiedApprover.name : null,
-        role: user.role || 'epos',
-        reason: reason || 'no_sale',
-        via,
-      }),
-    ]
-  ).catch((e) => console.warn('[audit_events] drawer kick log warning:', e.message));
-
-  return ok(res, { ok: true, via, result: executionResult, audit_id: auditId });
+  try {
+    const result = await openDrawerNetwork(printer);
+    return ok(res, { ok: true, via: 'network', result });
+  } catch (err) {
+    console.error(`[print] drawer open failed: printer=${printer.id} error=${err.message}`);
+    throw badRequest(err.message + ' — run print-agent on the till for USB drawers');
+  }
 }));
 
-// Print agent poll (authenticated restaurant/epos)
+/**
+ * Print agent poll (authenticated restaurant/epos). Queued jobs are claimed with SELECT ... FOR UPDATE SKIP LOCKED, so
+ * two pollers never receive the same job. A claim that is not acknowledged within two minutes is offered again.
+ */
 router.get('/print/queue', asyncHandler(async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [rid(req), 'print_queue'],
-  );
-  const q = Array.isArray(rows[0]?.data) ? rows[0].data.filter((j) => j.status === 'queued') : [];
-  ok(res, q);
+  const r = rid(req);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: picked } = await client.query(
+      `SELECT id FROM print_jobs
+        WHERE restaurant_id = $1 AND branch_id IS NOT DISTINCT FROM $2::text
+          AND (status = 'queued' OR (status = 'claimed' AND claimed_at < NOW() - INTERVAL '2 minutes'))
+        ORDER BY created_at, id
+        LIMIT 50
+        FOR UPDATE SKIP LOCKED`,
+      [r, printBranch(req)],
+    );
+    let claimed = [];
+    if (picked.length) {
+      const { rows } = await client.query(
+        `UPDATE print_jobs SET status = 'claimed', claimed_at = NOW()
+          WHERE restaurant_id = $1 AND id = ANY($2::text[])
+          RETURNING id, payload, payload_b64`,
+        [r, picked.map((p) => p.id)],
+      );
+      claimed = rows;
+    }
+    await client.query('COMMIT');
+    ok(res, claimed.map((j) => ({ ...(j.payload || {}), id: j.id, status: 'queued', payload_b64: j.payload_b64 })));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }));
 
 router.post('/print/queue/:id/ack', asyncHandler(async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [rid(req), 'print_queue'],
+  const { rowCount } = await pool.query(
+    `UPDATE print_jobs SET status = 'done', done_at = NOW()
+      WHERE id = $1 AND restaurant_id = $2 AND status IN ('queued', 'claimed') AND branch_id IS NOT DISTINCT FROM $3::text`,
+    [req.params.id, rid(req), printBranch(req)],
   );
-  let q = Array.isArray(rows[0]?.data) ? rows[0].data : [];
-  q = q.map((j) => (j.id === req.params.id ? { ...j, status: 'done', done_at: new Date().toISOString() } : j));
-  await pool.query(
-    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
-     VALUES ($1, 'print_queue', $2::jsonb, NOW())
-     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-    [rid(req), JSON.stringify(q)],
-  );
-  ok(res, { ok: true });
+  ok(res, { ok: true, acked: rowCount > 0 });
 }));
 
 // --- Caller ID ---
@@ -681,12 +653,14 @@ async function saveCalls(restaurantId, list) {
 }
 
 router.get('/callerid/live', asyncHandler(async (req, res) => {
+  // Calls come in on the restaurant's line and are kept at restaurant level. A branch login does not see them.
+  if (branchId(req)) return ok(res, []);
   ok(res, await loadCalls(rid(req)));
 }));
 
 const inboundHandler = asyncHandler(async (req, res) => {
-  // Auth: Bearer restaurant token OR X-Callerid-Secret matching callerid webhook_secret / password
-  // OR cryptographic Twilio signature verification (X-Twilio-Signature with Auth Token)
+  // Auth: Bearer restaurant token OR X-Callerid-Secret matching integrations.callerid webhook_secret
+  // Also accepts Twilio form posts with AccountSid matching stored username
   const body = req.body || {};
   const phone = calleridProv.normalizePhone(body.From || body.from || body.phone || body.caller);
   const restaurantHint = body.restaurant_id || req.headers['x-restaurant-id'] || req.query.restaurant_id;
@@ -699,54 +673,22 @@ const inboundHandler = asyncHandler(async (req, res) => {
     const all = await loadIntegrations(rId);
     const entry = all.callerid || {};
     const keys = decryptedKeys(entry, 'callerid');
-    const webhookSecret = keys.webhook_secret;
-    const authToken = keys.password;
-    const callerIdHdr = req.headers['x-callerid-secret'];
-    const twilioSigHdr = req.headers['x-twilio-signature'];
-
-    let authenticated = false;
-
-    // 1. Shared secret verification (timing-safe)
-    if (callerIdHdr && typeof callerIdHdr === 'string') {
-      if (webhookSecret && safeTimingCompare(callerIdHdr, webhookSecret)) {
-        authenticated = true;
-      } else if (authToken && safeTimingCompare(callerIdHdr, authToken)) {
-        authenticated = true;
-      }
-    }
-
-    // 2. Twilio cryptographic signature verification (HMAC-SHA1 over URL + params with Auth Token)
-    if (!authenticated && twilioSigHdr && typeof twilioSigHdr === 'string' && authToken) {
-      const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-      const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
-      const reqUrl = req.headers['x-original-url'] || `${proto}://${host}${req.originalUrl || req.url || '/api/v1/integrations/callerid/inbound'}`;
-      if (verifyTwilioSignature(authToken, twilioSigHdr, reqUrl, req.body)) {
-        authenticated = true;
-      }
-    }
-
-    if (!authenticated) {
-      throw unauthorized('Invalid caller ID webhook credentials');
-    }
+    const secret = keys.webhook_secret || keys.password;
+    // Only the shared secret authenticates a caller-ID event (constant-time compare). AccountSid is an
+    // identifier, not a credential, so it no longer authorises a request (audit 04 S-10, roadmap 6.2).
+    const given = Buffer.from(String(req.headers['x-callerid-secret'] || ''));
+    const expected = Buffer.from(String(secret || ''));
+    const okSecret = !!secret && given.length === expected.length && crypto.timingSafeEqual(given, expected);
+    if (!okSecret) throw unauthorized('Invalid caller ID webhook credentials');
   } else {
     throw unauthorized('restaurant_id required for caller ID webhook');
   }
 
   if (!phone) throw badRequest('Missing caller phone (From)');
 
-  // call_seq
-  const seqRows = await pool.query(
-    'SELECT data FROM restaurant_blobs WHERE restaurant_id = $1 AND key = $2',
-    [rId, 'call_seq'],
-  );
-  let seq = +(seqRows[0]?.data) || 230;
-  seq += 1;
-  await pool.query(
-    `INSERT INTO restaurant_blobs (restaurant_id, key, data, updated_at)
-     VALUES ($1, 'call_seq', $2::jsonb, NOW())
-     ON CONFLICT (restaurant_id, key) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-    [rId, JSON.stringify(seq)],
-  );
+  // Call number: atomic per restaurant (SEC-M17). The old read-then-write of call_seq lost updates and always read 230.
+  const seq = await nextCallNumber(rId);
+
 
   const call = {
     id: 'lc' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex'),
@@ -776,8 +718,3 @@ router.post('/callerid/inbound', inboundHandler);
 module.exports = router;
 module.exports.inboundHandler = inboundHandler;
 module.exports.loadIntegrations = loadIntegrations;
-module.exports.sanitizeProviderError = sanitizeProviderError;
-module.exports.verifyTwilioSignature = verifyTwilioSignature;
-module.exports.safeTimingCompare = safeTimingCompare;
-module.exports.mergeKeys = mergeKeys;
-module.exports.maskIntegrationEntry = maskIntegrationEntry;

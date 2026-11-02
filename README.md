@@ -44,7 +44,7 @@ Configure `.env` with production parameters:
 - `PGPASSWORD`: Set secure database password (`NEEDS CONFIGURATION`)
 - `JWT_SECRET`: Set strong random secret (`NEEDS CONFIGURATION`)
 - `INTEGRATIONS_SECRET_KEY`: Set encryption secret (min 16 chars) for integration credentials at rest (`NEEDS CONFIGURATION`)
-- `CORS_ORIGIN`: Explicit comma-separated origins without wildcards, e.g. `https://admin.yourdomain.com,https://app.yourdomain.com` (`NEEDS CONFIGURATION` — wildcards or unset values trigger fatal exit in production)
+- `CORS_ORIGIN`: Explicit comma-separated origins without wildcards, e.g. `https://admin.yourdomain.com,https://site1.yourdomain.com,https://site2.yourdomain.com,https://site3.yourdomain.com` (`NEEDS CONFIGURATION` — wildcards or unset values trigger fatal exit in production)
 - `GATEWAY_JWT_VERIFY=optional` (or `strict`; must not be `off` in production)
 - `STRIPE_SECRET_KEY`: Optional platform Stripe secret key (`NEEDS CONFIGURATION` if Stripe billing is used)
 - `STRIPE_WEBHOOK_SECRET`: Optional Stripe webhook signing secret (`NEEDS CONFIGURATION` if Stripe webhooks are used)

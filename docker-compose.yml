@@ -19,14 +19,14 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${PGUSER:-cravedash} -d ${PGDATABASE:-cravedash}" ]
       interval: 5s
       timeout: 5s
       retries: 10
 
   migrate:
     build: .
-    command: ["node", "shared/scripts/migrate.js"]
+    command: [ "node", "shared/scripts/migrate.js" ]
     env_file: .env
     environment: *common-env
     depends_on:
@@ -35,7 +35,7 @@ services:
 
   gateway:
     build: .
-    command: ["node", "services/gateway/src/index.js"]
+    command: [ "node", "services/gateway/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -69,7 +69,7 @@ services:
 
   auth:
     build: .
-    command: ["node", "services/auth-service/src/index.js"]
+    command: [ "node", "services/auth-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -82,7 +82,7 @@ services:
 
   catalog:
     build: .
-    command: ["node", "services/catalog-service/src/index.js"]
+    command: [ "node", "services/catalog-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -95,7 +95,7 @@ services:
 
   order:
     build: .
-    command: ["node", "services/order-service/src/index.js"]
+    command: [ "node", "services/order-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -108,7 +108,7 @@ services:
 
   restaurant:
     build: .
-    command: ["node", "services/restaurant-service/src/index.js"]
+    command: [ "node", "services/restaurant-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -121,7 +121,7 @@ services:
 
   platform:
     build: .
-    command: ["node", "services/platform-service/src/index.js"]
+    command: [ "node", "services/platform-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -134,7 +134,7 @@ services:
 
   epos:
     build: .
-    command: ["node", "services/epos-service/src/index.js"]
+    command: [ "node", "services/epos-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env
@@ -147,7 +147,7 @@ services:
 
   reporting:
     build: .
-    command: ["node", "services/reporting-service/src/index.js"]
+    command: [ "node", "services/reporting-service/src/index.js" ]
     env_file: .env
     environment:
       <<: *common-env

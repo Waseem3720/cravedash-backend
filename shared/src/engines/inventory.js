@@ -1,32 +1,15 @@
+const crypto = require('crypto');
 const { readDoc, writeDoc, appendRow, listRows, round4, round2, pool } = require('./helpers');
 
 /** Simple advisory lock per restaurant ingredient to reduce stock races. */
 async function withStockLock(restaurantId, ingredientId, fn) {
   const key = `inv:${restaurantId}:${ingredientId}`;
   const client = await pool.connect();
-  let locked = false;
   try {
-    try {
-      await client.query('SELECT pg_advisory_lock(hashtext($1))', [key]);
-      locked = true;
-    } catch (err) {
-      // In production, advisory locks must be strictly enforced.
-      // Only bypass in non-production environments if the driver or sandbox lacks advisory lock support.
-      if (process.env.NODE_ENV === 'production' || (err.code !== '42883' && !err.message?.includes('advisory'))) {
-        throw err;
-      }
-    }
+    await client.query('SELECT pg_advisory_lock(hashtext($1))', [key]);
     return await fn(client);
   } finally {
-    if (locked) {
-      try {
-        await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]);
-      } catch (err) {
-        if (process.env.NODE_ENV === 'production') {
-          console.error('[inventory-lock] Failed to release advisory lock:', err.message);
-        }
-      }
-    }
+    try { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]); } catch { /* ignore */ }
     client.release();
   }
 }
@@ -80,10 +63,11 @@ function parseRecipeItems(items, ingredients) {
  * @param {'in'|'out'} dir
  */
 async function postStockMove(restaurantId, {
-  ingredient_id, ingredient, dir, qty, reason, cost, note, ref, by,
+  ingredient_id, ingredient, dir, qty, reason, cost, note, ref, by, line_key,
 }) {
-  const lockId = String(ingredient_id || ingredient || 'unknown');
-  return withStockLock(restaurantId, lockId, async () => {
+  // BUG-013: the whole ingredient list is saved as one document, so every move for a restaurant takes the same lock.
+  // A per-ingredient lock let two moves on different ingredients read the same list and overwrite each other.
+  return withStockLock(restaurantId, 'ingredients', async () => {
     const list = await getIngredients(restaurantId);
     const ing = findIngredient(list, ingredient_id || ingredient);
     if (!ing) {
@@ -115,8 +99,7 @@ async function postStockMove(restaurantId, {
         ing.avg_cost = round2(unit);
       }
     }
-    await saveIngredients(restaurantId, list);
-    const move = await appendRow(restaurantId, 'inventory', 'stock_moves', {
+    const payload = {
       ingredient_id: ing.id,
       ingredient: ing.name,
       dir,
@@ -127,7 +110,40 @@ async function postStockMove(restaurantId, {
       note: note || null,
       ref: ref || null,
       by: by || null,
+      line_key: line_key || null,
+    };
+    if (!line_key) {
+      await saveIngredients(restaurantId, list);
+      const move = await appendRow(restaurantId, 'inventory', 'stock_moves', payload);
+      return { move, ingredient: ing };
+    }
+    // An order line is written move-first, under an id derived from its key. A second write of the same line is refused
+    // with STOCK_MOVE_EXISTS. If the stock list cannot be saved afterwards, the move is removed again, so a retry posts the
+    // line once and never deducts it twice (AUD-P1-2).
+    const moveId = `sm_${crypto.createHash('sha256').update(String(line_key)).digest('hex').slice(0, 40)}`;
+    const existing = await pool.query(
+      'SELECT 1 FROM domain_rows WHERE restaurant_id = $1 AND domain = $2 AND collection = $3 AND id = $4',
+      [restaurantId, 'inventory', 'stock_moves', moveId],
+    );
+    if (existing.rows[0]) {
+      const err = new Error('This order line was already posted to stock');
+      err.status = 409; err.code = 'STOCK_MOVE_EXISTS'; throw err;
+    }
+    const move = await appendRow(restaurantId, 'inventory', 'stock_moves', { ...payload, id: moveId }).catch((err) => {
+      if (err.message !== 'Ledger event id already exists') throw err;
+      const dup = new Error('This order line was already posted to stock');
+      dup.status = 409; dup.code = 'STOCK_MOVE_EXISTS';
+      throw dup;
     });
+    try {
+      await saveIngredients(restaurantId, list);
+    } catch (err) {
+      await pool.query(
+        'DELETE FROM domain_rows WHERE restaurant_id = $1 AND domain = $2 AND collection = $3 AND id = $4',
+        [restaurantId, 'inventory', 'stock_moves', moveId],
+      ).catch((undoErr) => console.error('[inventory] could not remove an unsaved stock move', undoErr.message));
+      throw err;
+    }
     return { move, ingredient: ing };
   });
 }
@@ -229,13 +245,18 @@ async function postGrn(restaurantId, { supplier, reference, lines, note, by, amo
 }
 
 /** Deduct BOM ingredients for a paid/accepted order. */
-async function deductForOrder(restaurantId, order) {
+async function deductForOrder(restaurantId, order, { reverse = false } = {}) {
   const ingredients = await getIngredients(restaurantId);
   if (!ingredients.length) return { moves: [], skipped: 'no_ingredients' };
   const recipes = await getRecipes(restaurantId);
+  const reason = reverse ? 'sale_reversal' : 'sale_deduction';
+  // A line that already has a move for this order is not posted again. A retry after a partial run relies on this (AUD-P1-2).
+  const posted = new Set(
+    (await listRows(restaurantId, 'inventory', 'stock_moves')).map((m) => m.line_key).filter(Boolean),
+  );
   const moves = [];
   const items = order.items || (order.data && order.data.items) || [];
-  for (const item of items) {
+  for (const [itemIndex, item] of items.entries()) {
     const productId = item.product_id || item.product || item.id;
     const variation = item.variation || item.variation_name || '';
     const recipe = recipes.find((r) => String(r.product) === String(productId)
@@ -245,20 +266,31 @@ async function deductForOrder(restaurantId, order) {
     const yieldQty = Math.max(1, +recipe.yield || 1);
     const bom = parseRecipeItems(recipe.items, ingredients);
     const orderQty = Math.max(1, +item.qty || +item.quantity || 1);
-    for (const line of bom) {
+    for (const [lineIndex, line] of bom.entries()) {
       const need = round4((line.qty / yieldQty) * orderQty);
+      const lineKey = `${order.id}|${reason}|${itemIndex}|${lineIndex}`;
+      if (posted.has(lineKey)) continue;
       try {
         const r = await postStockMove(restaurantId, {
           ingredient_id: line.ingredient_id || line.name,
-          dir: 'out',
+          dir: reverse ? 'in' : 'out',
           qty: need,
-          reason: 'sale_deduction',
+          reason,
           ref: order.id,
           note: `Order #${order.id} · ${item.name || productId}`,
+          line_key: lineKey,
         });
+        posted.add(lineKey);
         moves.push(r.move);
       } catch (err) {
-        // Soft-fail insufficient stock so order flow is not blocked; log as wastage-style note
+        // The line was posted by an earlier run: nothing to do.
+        if (err && err.code === 'STOCK_MOVE_EXISTS') {
+          posted.add(lineKey);
+          continue;
+        }
+        // Insufficient stock or an unknown ingredient is a business outcome: the line is logged and the order flow goes on.
+        // Any other error is a failure of this effect, so it is thrown and the effect is retried (AUD-P1-2).
+        if (!(err && err.status === 400)) throw err;
         moves.push({
           error: err.message,
           ingredient: line.name,

@@ -14,22 +14,7 @@ const HOST = listenHost();
 app.use('/api/v1/epos', requireAuth, epos);
 app.use('/api/v1/sync', requireAuth, sync);
 
-// Post-mount error handler converting uncaught errors to standard JSON
-const { fail } = require('@cravedash/shared/src/response');
-const { AppError } = require('@cravedash/shared/src/errors');
-app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  if (!(err instanceof AppError)) {
-    console.error('[epos-service]', err);
-    err = new AppError(err.message || 'Internal error', 500, 'INTERNAL_ERROR');
-  }
-  fail(res, err);
+app.listen(PORT, HOST, () => {
+  console.log(`EPOS service on http://${HOST}:${PORT}`);
+  require('@cravedash/shared/src/db').warmPool();
 });
-
-if (require.main === module) {
-  app.listen(PORT, HOST, () => {
-    console.log(`EPOS service on http://${HOST}:${PORT}`);
-  });
-}
-
-module.exports = app;

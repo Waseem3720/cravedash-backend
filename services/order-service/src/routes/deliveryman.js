@@ -1,1034 +1,634 @@
+/**
+ * Rider (deliveryman) app routes, mounted at /api/v1/deliveryman. Every route works on the caller's own rider record
+ * (users.id = deliverymen.id). Amounts in this API are in pence, as the rider app expects. The database stores pounds.
+ * Only the cash handover confirmation is for the restaurant side (admin or till).
+ */
 const express = require('express');
+const crypto = require('crypto');
 const pool = require('@cravedash/shared/src/db');
 const { ok, created } = require('@cravedash/shared/src/response');
 const asyncHandler = require('@cravedash/shared/src/asyncHandler');
-const { restaurantId, requireAuth, requireRole } = require('@cravedash/shared/src/authMiddleware');
-const { badRequest, notFound, forbidden } = require('@cravedash/shared/src/errors');
+const { restaurantId } = require('@cravedash/shared/src/authMiddleware');
+const { badRequest, forbidden, notFound } = require('@cravedash/shared/src/errors');
+const { changeOrderStatus } = require('./orders');
 
 const router = express.Router();
 
-// All routes under /api/v1/deliveryman require authenticated rider or admin/epos role
-router.use(requireAuth, requireRole('rider', 'courier', 'restaurant', 'super', 'epos'));
-
-router.use(asyncHandler(async (req, res, next) => {
-  const directId = req.user?.delivery_man_id || req.user?.sub || req.user?.id;
-  const email = req.user?.email;
-
-  // 1. Try direct ID
-  if (directId) {
-    const { rows } = await pool.query('SELECT * FROM deliverymen WHERE id = $1 LIMIT 1', [directId]);
-    if (rows[0]) {
-      req.deliveryman = rows[0];
-      req.riderId = rows[0].id;
-      return next();
-    }
-  }
-
-  // 2. Try email
-  if (email) {
-    const { rows } = await pool.query('SELECT * FROM deliverymen WHERE LOWER(email) = LOWER($1) LIMIT 1', [email]);
-    if (rows[0]) {
-      req.deliveryman = rows[0];
-      req.riderId = rows[0].id;
-      return next();
-    }
-  }
-
-  req.riderId = directId ? String(directId) : 'dm_1';
-  next();
-}));
+const toPence = (pounds) => Math.round((Number(pounds) || 0) * 100);
+const toPounds = (pence) => Math.round(Number(pence) || 0) / 100;
+const ACTIVE = ['ready_for_serve', 'out_for_delivery'];
+const DEFAULT_PREFS = { theme: 'light', sound: true, vibration: true, location: true };
 
 function rid(req) {
-  try {
-    return restaurantId(req);
-  } catch {
-    return req.headers['x-restaurant-id'] || 'r1';
-  }
+  return restaurantId(req);
 }
 
-function getRiderId(req) {
-  return req.riderId || req.user?.delivery_man_id || req.user?.sub || req.user?.id || 'dm_1';
+/** Only riders use these routes, except the cash handover confirmation, which restaurant staff do. */
+router.use((req, res, next) => {
+  const isConfirm = req.method === 'POST' && /^\/cash\/handovers\/[^/]+\/confirm\/?$/.test(req.path);
+  if (isConfirm) {
+    if (['restaurant', 'super', 'epos'].includes(req.user?.role)) return next();
+    return next(forbidden('Only restaurant staff can confirm a cash handover'));
+  }
+  if (req.user?.role === 'driver') return next();
+  return next(forbidden('Only a rider session can use the deliveryman app'));
+});
+
+async function myRider(req) {
+  const { rows } = await pool.query('SELECT * FROM deliverymen WHERE id = $1 AND restaurant_id = $2', [req.user.sub, rid(req)]);
+  if (!rows[0]) throw notFound('Rider not found');
+  return rows[0];
 }
 
-async function fetchRider(riderId, restaurantIdVal) {
-  if (riderId) {
-    const { rows } = await pool.query(
-      `SELECT d.*, r.name AS restaurant_name
-       FROM deliverymen d
-       LEFT JOIN restaurants r ON d.restaurant_id = r.id
-       WHERE d.id = $1
-       LIMIT 1`,
-      [riderId]
-    );
-    if (rows[0]) return rows[0];
-  }
-  return null;
+/** SQL condition: the order is assigned to this rider. Rider ids are plain tokens, so anything else is dropped. */
+function assignedTo(riderId) {
+  return `(o.data->>'delivery_man_id') = '${String(riderId).replace(/[^A-Za-z0-9_-]/g, '')}'`;
 }
 
-function parseData(val) {
-  if (typeof val === 'string') {
-    try { return JSON.parse(val); } catch { return {}; }
-  }
-  return val || {};
+function hhmm(value) {
+  const d = new Date(value);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-function formatRiderProfile(dm, user) {
-  const data = parseData(dm?.data);
-  const isOnline = data.available !== false && data.vehicleAvailable !== false && (!dm?.status || dm.status === 'active' || dm.status === 'approved');
-  return {
-    id: dm?.id || user?.id || 'rider-demo',
-    name: dm?.name || user?.name || 'Alex Rider',
-    restaurant: dm?.restaurant_name || 'Porto Piri Piri',
-    phone: dm?.phone || user?.phone || '07700 900123',
-    email: dm?.email || user?.email || 'rider@portopiripiri.co.uk',
-    vehicle: dm?.vehicle || user?.vehicle || 'Car',
-    reg: data.reg || data.vehicle_reg || 'DEMO 01',
-    vehicleAvailable: isOnline,
-    zones: data.zones || ['Glasgow South · G41', 'Shawlands · G43'],
-    capacity: Number(data.capacity || 3),
-  };
-}
-
-async function logRiderEvent(restaurantIdVal, riderId, eventType, title, amount = null, orderId = null, shiftId = null, details = {}) {
-  const id = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  try {
-    await pool.query(
-      `INSERT INTO deliveryman_events (id, restaurant_id, deliveryman_id, shift_id, order_id, event_type, title, amount, details, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW())`,
-      [id, restaurantIdVal, riderId, shiftId, orderId, eventType, title, amount, JSON.stringify(details)]
-    );
-  } catch (err) {
-    console.warn('[deliveryman-events] Failed to record event:', err.message);
+/** Money and tips of one period, from the rider's delivered orders and driver payments. Amounts in pounds. */
+async function periodStats(restaurant, riderId, since, until = null) {
+  // The rider id is part of the condition itself (assignedTo), so only the restaurant and the dates are parameters.
+  const params = [restaurant, since];
+  let untilSql = '';
+  if (until) {
+    params.push(until);
+    untilSql = `AND (o.data->>'delivered_at')::timestamptz <= $${params.length}`;
   }
-}
-
-/** 5. GET /api/v1/deliveryman/profile */
-router.get('/profile', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const dm = await fetchRider(riderId, r);
-  ok(res, formatRiderProfile(dm, req.user));
-}));
-
-/** 6. PATCH /api/v1/deliveryman/vehicle-status */
-router.patch('/vehicle-status', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { vehicleAvailable } = req.body || {};
-  const isAvailable = Boolean(vehicleAvailable);
-
-  const dm = await fetchRider(riderId, r);
-  const data = parseData(dm?.data);
-  data.vehicleAvailable = isAvailable;
-  data.available = isAvailable;
-
-  await pool.query(
-    `UPDATE deliverymen
-     SET data = $3::jsonb, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2`,
-    [riderId, r, JSON.stringify(data)]
-  );
-
-  ok(res, {
-    vehicleAvailable: isAvailable,
-    message: isAvailable ? 'Vehicle marked available' : 'Vehicle marked unavailable',
-  });
-}));
-
-/** 7. GET /api/v1/deliveryman/preferences */
-router.get('/preferences', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const dm = await fetchRider(riderId, r);
-  const data = parseData(dm?.data);
-  const prefs = data.preferences || {
-    theme: 'light',
-    sound: true,
-    vibration: true,
-    location: true,
-  };
-  ok(res, prefs);
-}));
-
-/** 8. PUT /api/v1/deliveryman/preferences */
-router.put('/preferences', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const body = req.body || {};
-  const dm = await fetchRider(riderId, r);
-  const data = parseData(dm?.data);
-
-  data.preferences = {
-    theme: body.theme || data.preferences?.theme || 'light',
-    sound: body.sound !== undefined ? Boolean(body.sound) : (data.preferences?.sound ?? true),
-    vibration: body.vibration !== undefined ? Boolean(body.vibration) : (data.preferences?.vibration ?? true),
-    location: body.location !== undefined ? Boolean(body.location) : (data.preferences?.location ?? true),
-  };
-
-  await pool.query(
-    `UPDATE deliverymen
-     SET data = $3::jsonb, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2`,
-    [riderId, r, JSON.stringify(data)]
-  );
-
-  ok(res, data.preferences);
-}));
-
-/** 9. POST /api/v1/deliveryman/location */
-router.post('/location', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { latitude, longitude, recorded_at } = req.body || {};
-  if (latitude == null || longitude == null) {
-    throw badRequest('latitude and longitude are required');
-  }
-
-  const recAt = recorded_at || new Date().toISOString();
-  await pool.query(
-    `INSERT INTO deliveryman_locations (deliveryman_id, restaurant_id, latitude, longitude, recorded_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
-     ON CONFLICT (deliveryman_id)
-     DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, recorded_at = EXCLUDED.recorded_at, updated_at = NOW()`,
-    [riderId, r, latitude, longitude, recAt]
-  );
-
-  ok(res, {
-    success: true,
-    recorded_at: recAt,
-  });
-}));
-
-/** 10. GET /api/v1/deliveryman/dashboard */
-router.get('/dashboard', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  // 1. Assigned active orders count
-  const { rows: assignedRows } = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2 AND status IN ('ready_for_serve', 'picked_up', 'out_for_delivery')`,
-    [r, riderId]
-  );
-
-  // 2. Delivered today count & tips today total
-  const { rows: todayRows } = await pool.query(
-    `SELECT COUNT(*)::int AS delivered_count,
-            COALESCE(SUM(COALESCE(tip, 0) + COALESCE((data->>'rider_tip')::numeric, 0)), 0)::numeric AS tips_total
-     FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2
-       AND status IN ('delivered', 'completed')
-       AND DATE(updated_at) = CURRENT_DATE`,
-    [r, riderId]
-  );
-
-  // 3. Active shift
-  const { rows: shiftRows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active'
-     ORDER BY started_at DESC LIMIT 1`,
-    [r, riderId]
-  );
-
-  let activeShift = null;
-  if (shiftRows[0]) {
-    const s = shiftRows[0];
-    activeShift = {
-      id: s.id,
-      started_at: s.started_at,
-      opening_cash: Math.round(Number(s.opening_cash) * 100), // in pence as per spec
-      float_owner: s.float_owner,
-    };
-  }
-
-  const assignedCount = assignedRows[0]?.count || 0;
-  const deliveredToday = todayRows[0]?.delivered_count || 0;
-  const tipsToday = Math.round(Number(todayRows[0]?.tips_total || 0) * 100);
-
-  ok(res, {
-    assigned_orders_count: assignedCount,
-    delivered_today_count: deliveredToday,
-    tips_today_total: tipsToday,
-    active_shift: activeShift,
-  });
-}));
-
-/** 11. GET /api/v1/deliveryman/shifts/current */
-router.get('/shifts/current', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
   const { rows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active'
-     ORDER BY started_at DESC LIMIT 1`,
-    [r, riderId]
+    `SELECT o.id, o.payment_method, o.data FROM orders o
+      WHERE o.restaurant_id = $1 AND ${assignedTo(riderId)} AND o.status = 'delivered'
+        AND (o.data->>'delivered_at')::timestamptz >= $2 ${untilSql}`,
+    params,
   );
+  let collected = 0;
+  let cashTips = 0;
+  let onlineTips = 0;
+  for (const r of rows) {
+    const d = r.data || {};
+    collected += r.payment_method === 'cash' ? Number(d.cash_collected) || 0 : 0;
+    const tip = Number(d.tip_amount) || 0;
+    if (r.payment_method === 'cash') cashTips += tip;
+    else onlineTips += tip;
+  }
+  return {
+    orders: rows.length,
+    collected: Math.round(collected * 100) / 100,
+    cashTips: Math.round(cashTips * 100) / 100,
+    onlineTips: Math.round(onlineTips * 100) / 100,
+  };
+}
 
-  if (!rows[0]) return ok(res, null);
-  const s = rows[0];
-  ok(res, {
+async function handoverTotals(restaurant, riderId, since) {
+  const { rows } = await pool.query(
+    `SELECT status, COALESCE(SUM(amount), 0)::float AS total FROM rider_cash_handovers
+      WHERE restaurant_id = $1 AND deliveryman_id = $2 AND created_at >= $3 GROUP BY status`,
+    [restaurant, riderId, since],
+  );
+  const by = Object.fromEntries(rows.map((r) => [r.status, Number(r.total) || 0]));
+  return { pending: by.pending_confirmation || 0, confirmed: by.confirmed || 0 };
+}
+
+async function openShift(restaurant, riderId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM rider_shifts WHERE restaurant_id = $1 AND deliveryman_id = $2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+    [restaurant, riderId],
+  );
+  return rows[0] || null;
+}
+
+function shiftView(s) {
+  return {
     id: s.id,
     started_at: s.started_at,
-    opening_cash: Math.round(Number(s.opening_cash) * 100),
+    ended_at: s.ended_at,
+    opening_cash: toPence(s.opening_cash),
     float_owner: s.float_owner,
-    status: s.status,
-  });
-}));
+    actual_closing: s.actual_closing == null ? null : toPence(s.actual_closing),
+    expected_closing: s.expected_closing == null ? null : toPence(s.expected_closing),
+    variance: s.variance == null ? null : toPence(s.variance),
+    restaurant_due: s.restaurant_due == null ? null : toPence(s.restaurant_due),
+    orders: s.orders_count,
+    cash_collected: s.cash_collected == null ? null : toPence(s.cash_collected),
+    cash_tips: s.cash_tips == null ? null : toPence(s.cash_tips),
+    online_tips: s.online_tips == null ? null : toPence(s.online_tips),
+    note: s.note,
+    z_number: s.z_number,
+  };
+}
 
-/** 12. POST /api/v1/deliveryman/shifts/start */
-router.post('/shifts/start', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const dm = await fetchRider(riderId, r);
-  const { opening_cash = 0, float_owner = 'restaurant' } = req.body || {};
-
-  // Check if shift is already active
-  const { rows: existing } = await pool.query(
-    `SELECT id FROM deliveryman_shifts WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active' LIMIT 1`,
-    [r, riderId]
+/** The cash the rider holds now, in pence (cheff/deliveryman cash/summary). */
+async function cashPosition(restaurant, rider) {
+  const shift = await openShift(restaurant, rider.id);
+  const since = shift ? shift.started_at : new Date(new Date().setHours(0, 0, 0, 0));
+  const stats = await periodStats(restaurant, rider.id, since);
+  const handovers = await handoverTotals(restaurant, rider.id, since);
+  const floatHeld = shift && shift.float_owner === 'restaurant' ? Number(shift.opening_cash) || 0 : 0;
+  const restaurantCashHeld = floatHeld + stats.collected;
+  const { rows: pay } = await pool.query(
+    'SELECT COALESCE(SUM(amount), 0)::float AS total FROM driver_payments WHERE restaurant_id = $1 AND driver_id = $2 AND pay_date = CURRENT_DATE',
+    [restaurant, rider.id],
   );
-  if (existing[0]) {
-    throw badRequest('An active shift is already in progress');
-  }
+  return {
+    shift,
+    since,
+    stats,
+    handovers,
+    summary: {
+      restaurant_cash_held: toPence(restaurantCashHeld),
+      held_order_cash: toPence(Math.max(0, stats.collected - handovers.pending - handovers.confirmed)),
+      restaurant_float_held: toPence(floatHeld),
+      physical_cash: toPence(restaurantCashHeld + stats.cashTips - handovers.confirmed),
+      pending_handovers: toPence(handovers.pending),
+      collected_today: toPence(stats.collected),
+      confirmed_handovers: toPence(handovers.confirmed),
+      cash_tips: toPence(stats.cashTips),
+      online_tips: toPence(stats.onlineTips),
+      delivery_pay: toPence(pay[0].total),
+    },
+  };
+}
 
-  const shiftId = `shift-${Date.now()}`;
-  const openingDecimal = Number(opening_cash) > 100 ? (Number(opening_cash) / 100) : Number(opening_cash);
+function riderOrder(o) {
+  const c = o.customer || {};
+  const d = o.data || {};
+  const items = Array.isArray(o.items) ? o.items : [];
+  return {
+    id: String(o.id),
+    name: c.name || null,
+    address: c.address || null,
+    postcode: c.postcode || null,
+    phone: c.phone || null,
+    zone: d.zone || null,
+    distance: d.distance ?? null,
+    total: toPence(o.total),
+    cashDue: o.payment_method === 'cash' && String(o.payment_status).toLowerCase() !== 'paid' ? toPence(o.total) : 0,
+    method: o.payment_method ? o.payment_method.charAt(0).toUpperCase() + o.payment_method.slice(1) : null,
+    status: o.status,
+    time: o.created_at ? hhmm(o.created_at) : null,
+    estimatedMins: d.prep_time ?? null,
+    items: items.map((it) => `${Number(it.qty || it.quantity) || 1}x ${it.name}`),
+    notes: o.note || null,
+  };
+}
 
+async function myOrder(req) {
+  const rider = await myRider(req);
   const { rows } = await pool.query(
-    `INSERT INTO deliveryman_shifts (id, restaurant_id, deliveryman_id, opening_cash, float_owner, status, started_at)
-     VALUES ($1, $2, $3, $4, $5, 'active', NOW())
-     RETURNING *`,
-    [shiftId, r, riderId, openingDecimal, String(float_owner)]
+    `SELECT o.* FROM orders o WHERE o.id = $1 AND o.restaurant_id = $2 AND ${assignedTo(rider.id)}`,
+    [req.params.orderId, rid(req)],
   );
+  if (!rows[0]) throw notFound('Order not found');
+  return { rider, order: rows[0] };
+}
 
-  await logRiderEvent(r, riderId, 'shift_start', 'Shift Started', openingDecimal, null, shiftId, {
-    opening_cash,
-    float_owner,
-  });
-
-  ok(res, {
-    id: shiftId,
-    name: dm?.name || req.user?.name || 'Alex Rider',
-    opening_cash: Number(opening_cash),
-    float_owner: String(float_owner),
-    started_at: rows[0].started_at,
-  });
-}));
-
-/** 13. POST /api/v1/deliveryman/shifts/end */
-router.post('/shifts/end', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const dm = await fetchRider(riderId, r);
-  const { actual_closing = 0, reason = '' } = req.body || {};
-
-  const { rows: shiftRows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active'
-     ORDER BY started_at DESC LIMIT 1`,
-    [r, riderId]
-  );
-  if (!shiftRows[0]) {
-    throw badRequest('No active shift found to end');
-  }
-  const shift = shiftRows[0];
-
-  // Calculate shift order metrics
-  const { rows: orderStats } = await pool.query(
-    `SELECT COUNT(*)::int AS orders_count,
-            COALESCE(SUM(CASE WHEN payment_method ILIKE '%cash%' OR data->>'cash_collected' IS NOT NULL THEN total ELSE 0 END), 0)::numeric AS cash_collected,
-            COALESCE(SUM(CASE WHEN data->>'cash_tip' IS NOT NULL THEN (data->>'cash_tip')::numeric ELSE 0 END), 0)::numeric AS cash_tips,
-            COALESCE(SUM(COALESCE(tip, 0)), 0)::numeric AS online_tips
-     FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2
-       AND status IN ('delivered', 'completed')
-       AND updated_at >= $3`,
-    [r, riderId, shift.started_at]
-  );
-
-  const stats = orderStats[0] || {};
-  const ordersDelivered = stats.orders_count || 0;
-  const cashCollectedPence = Math.round(Number(stats.cash_collected || 0) * 100);
-  const cashTipsPence = Math.round(Number(stats.cash_tips || 0) * 100);
-  const onlineTipsPence = Math.round(Number(stats.online_tips || 0) * 100);
-  const openingPence = Math.round(Number(shift.opening_cash || 0) * 100);
-
-  const expectedClosingPence = openingPence + cashCollectedPence;
-  const actualClosingPence = Number(actual_closing);
-  const variancePence = actualClosingPence - expectedClosingPence;
-  const restaurantDuePence = cashCollectedPence + (shift.float_owner === 'restaurant' ? openingPence : 0);
-  const zNumber = `RZ-${Date.now()}`;
-  const endedAt = new Date().toISOString();
-
+async function setOrderData(orderId, restaurant, patch) {
   await pool.query(
-    `UPDATE deliveryman_shifts
-     SET status = 'ended',
-         actual_closing = $3,
-         expected_closing = $4,
-         variance = $5,
-         restaurant_due = $6,
-         orders_count = $7,
-         cash_collected = $8,
-         cash_tips = $9,
-         online_tips = $10,
-         z_number = $11,
-         note = $12,
-         ended_at = $13,
-         updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2`,
-    [
-      shift.id,
-      r,
-      actualClosingPence / 100,
-      expectedClosingPence / 100,
-      variancePence / 100,
-      restaurantDuePence / 100,
-      ordersDelivered,
-      cashCollectedPence / 100,
-      cashTipsPence / 100,
-      onlineTipsPence / 100,
-      zNumber,
-      reason || 'Closing cash balanced',
-      endedAt,
-    ]
+    'UPDATE orders SET data = COALESCE(data, \'{}\'::jsonb) || $3::jsonb, updated_at = NOW() WHERE id = $1 AND restaurant_id = $2',
+    [orderId, restaurant, JSON.stringify(patch)],
   );
+}
 
-  await logRiderEvent(r, riderId, 'shift_end', 'Shift Ended', actualClosingPence / 100, null, shift.id, {
-    actual_closing: actualClosingPence,
-    variance: variancePence,
-    z_number: zNumber,
-  });
+/* ---------- Profile, vehicle, preferences, location ---------- */
 
+router.get('/profile', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const m = rider.metadata || {};
+  const { rows } = await pool.query('SELECT name FROM restaurants WHERE id = $1', [rid(req)]);
   ok(res, {
-    id: shift.id,
-    name: dm?.name || req.user?.name || 'Alex Rider',
-    opening_cash: openingPence,
-    actual_closing: actualClosingPence,
-    expected_closing: expectedClosingPence,
-    variance: variancePence,
-    restaurant_due: restaurantDuePence,
-    orders: ordersDelivered,
-    cash_collected: cashCollectedPence,
-    cash_tips: cashTipsPence,
-    online_tips: onlineTipsPence,
-    note: reason || 'Closing cash balanced',
-    z_number: zNumber,
-    ended_at: endedAt,
+    id: rider.id,
+    name: rider.name,
+    restaurant: rows[0]?.name || null,
+    phone: rider.phone,
+    email: rider.email,
+    vehicle: rider.vehicle,
+    reg: m.reg || null,
+    vehicleAvailable: m.vehicle_available ?? true,
+    zones: Array.isArray(m.zones) ? m.zones : [],
+    capacity: m.capacity || 3,
   });
 }));
 
-/** 14. GET /api/v1/deliveryman/shifts/x-report */
+router.patch('/vehicle-status', asyncHandler(async (req, res) => {
+  const value = req.body?.vehicleAvailable;
+  if (typeof value !== 'boolean') throw badRequest('vehicleAvailable must be true or false');
+  const rider = await myRider(req);
+  await pool.query(
+    "UPDATE deliverymen SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('vehicle_available', $3::boolean), updated_at = NOW() WHERE id = $1 AND restaurant_id = $2",
+    [rider.id, rid(req), value],
+  );
+  ok(res, { vehicleAvailable: value, message: value ? 'Vehicle marked available' : 'Vehicle marked unavailable' });
+}));
+
+router.get('/preferences', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const { rows } = await pool.query('SELECT data FROM rider_preferences WHERE deliveryman_id = $1', [rider.id]);
+  ok(res, { ...DEFAULT_PREFS, ...(rows[0]?.data || {}) });
+}));
+
+router.put('/preferences', asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const next = {};
+  if (body.theme !== undefined) {
+    if (!['light', 'dark'].includes(body.theme)) throw badRequest('theme must be light or dark');
+    next.theme = body.theme;
+  }
+  for (const key of ['sound', 'vibration', 'location']) {
+    if (body[key] !== undefined) {
+      if (typeof body[key] !== 'boolean') throw badRequest(`${key} must be true or false`);
+      next[key] = body[key];
+    }
+  }
+  const rider = await myRider(req);
+  const { rows } = await pool.query(
+    `INSERT INTO rider_preferences (deliveryman_id, restaurant_id, data) VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (deliveryman_id) DO UPDATE SET data = rider_preferences.data || EXCLUDED.data, updated_at = NOW()
+     RETURNING data`,
+    [rider.id, rid(req), JSON.stringify(next)],
+  );
+  ok(res, { ...DEFAULT_PREFS, ...rows[0].data });
+}));
+
+router.post('/location', asyncHandler(async (req, res) => {
+  const { latitude, longitude, heading, speed, recorded_at } = req.body || {};
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90) throw badRequest('latitude must be between -90 and 90');
+  if (!Number.isFinite(lng) || lng < -180 || lng > 180) throw badRequest('longitude must be between -180 and 180');
+  const rider = await myRider(req);
+  const at = recorded_at && !Number.isNaN(Date.parse(recorded_at)) ? new Date(recorded_at).toISOString() : new Date().toISOString();
+  await pool.query(
+    'INSERT INTO rider_locations (restaurant_id, deliveryman_id, latitude, longitude, heading, speed, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [rid(req), rider.id, lat, lng, Number.isFinite(Number(heading)) ? Number(heading) : null, Number.isFinite(Number(speed)) ? Number(speed) : null, at],
+  );
+  ok(res, { success: true, recorded_at: at });
+}));
+
+/* ---------- Dashboard and shifts ---------- */
+
+router.get('/dashboard', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const restaurant = rid(req);
+  const { rows } = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE o.status = ANY($2::text[]))::int AS assigned,
+       COUNT(*) FILTER (WHERE o.status = 'delivered' AND (o.data->>'delivered_at')::date = CURRENT_DATE)::int AS delivered_today,
+       COALESCE(SUM((o.data->>'tip_amount')::numeric) FILTER (WHERE o.status = 'delivered' AND (o.data->>'delivered_at')::date = CURRENT_DATE), 0)::float AS tips_today
+     FROM orders o WHERE o.restaurant_id = $1 AND ${assignedTo(rider.id)}`,
+    [restaurant, ACTIVE],
+  );
+  const shift = await openShift(restaurant, rider.id);
+  ok(res, {
+    assigned_orders_count: rows[0].assigned,
+    delivered_today_count: rows[0].delivered_today,
+    tips_today_total: toPence(rows[0].tips_today),
+    active_shift: shift ? { id: shift.id, started_at: shift.started_at, opening_cash: toPence(shift.opening_cash), float_owner: shift.float_owner } : null,
+  });
+}));
+
+router.get('/shifts/current', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const shift = await openShift(rid(req), rider.id);
+  if (!shift) return ok(res, null);
+  ok(res, { id: shift.id, started_at: shift.started_at, opening_cash: toPence(shift.opening_cash), float_owner: shift.float_owner, status: 'active' });
+}));
+
+router.post('/shifts/start', asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const opening = Number(body.opening_cash);
+  if (!Number.isInteger(opening) || opening < 0) throw badRequest('opening_cash must be a whole number of pence, zero or more');
+  const floatOwner = body.float_owner === 'rider' ? 'rider' : 'restaurant';
+  const rider = await myRider(req);
+  if (await openShift(rid(req), rider.id)) throw new (require('@cravedash/shared/src/errors').AppError)('A shift is already open', 409, 'CONFLICT');
+  const id = `shift-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
+  const { rows } = await pool.query(
+    'INSERT INTO rider_shifts (id, restaurant_id, deliveryman_id, opening_cash, float_owner) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    [id, rid(req), rider.id, toPounds(opening), floatOwner],
+  );
+  created(res, { id, name: rider.name, opening_cash: toPence(rows[0].opening_cash), float_owner: floatOwner, started_at: rows[0].started_at });
+}));
+
+router.post('/shifts/end', asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const actual = Number(body.actual_closing);
+  if (!Number.isInteger(actual) || actual < 0) throw badRequest('actual_closing must be a whole number of pence, zero or more');
+  const rider = await myRider(req);
+  const restaurant = rid(req);
+  const shift = await openShift(restaurant, rider.id);
+  if (!shift) throw notFound('No open shift');
+  const endedAt = new Date();
+  const stats = await periodStats(restaurant, rider.id, shift.started_at, endedAt);
+  const opening = Number(shift.opening_cash) || 0;
+  const expected = Math.round((opening + stats.collected) * 100) / 100;
+  const actualPounds = toPounds(actual);
+  const variance = Math.round((actualPounds - expected) * 100) / 100;
+  const zNumber = `RZ-${endedAt.getTime()}`;
+  const note = body.reason ? String(body.reason).slice(0, 500) : null;
+  const { rows } = await pool.query(
+    `UPDATE rider_shifts SET ended_at = $2, actual_closing = $3, expected_closing = $4, variance = $5,
+       restaurant_due = $6, orders_count = $7, cash_collected = $8, cash_tips = $9, online_tips = $10, note = $11, z_number = $12
+     WHERE id = $1 RETURNING *`,
+    [shift.id, endedAt, actualPounds, expected, variance, stats.collected, stats.orders, stats.collected, stats.cashTips, stats.onlineTips, note, zNumber],
+  );
+  ok(res, shiftView(rows[0]));
+}));
+
 router.get('/shifts/x-report', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows: shiftRows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active'
-     ORDER BY started_at DESC LIMIT 1`,
-    [r, riderId]
-  );
-  if (!shiftRows[0]) throw badRequest('No active shift found');
-  const shift = shiftRows[0];
-
-  const { rows: orderStats } = await pool.query(
-    `SELECT COUNT(*)::int AS orders_count,
-            COALESCE(SUM(CASE WHEN payment_method ILIKE '%cash%' OR data->>'cash_collected' IS NOT NULL THEN total ELSE 0 END), 0)::numeric AS cash_collected,
-            COALESCE(SUM(CASE WHEN data->>'cash_tip' IS NOT NULL THEN (data->>'cash_tip')::numeric ELSE 0 END), 0)::numeric AS cash_tips,
-            COALESCE(SUM(COALESCE(tip, 0)), 0)::numeric AS online_tips
-     FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2
-       AND status IN ('delivered', 'completed')
-       AND updated_at >= $3`,
-    [r, riderId, shift.started_at]
-  );
-
-  const stats = orderStats[0] || {};
-  const ordersDelivered = stats.orders_count || 0;
-  const cashCollectedPence = Math.round(Number(stats.cash_collected || 0) * 100);
-  const cashTipsPence = Math.round(Number(stats.cash_tips || 0) * 100);
-  const onlineTipsPence = Math.round(Number(stats.online_tips || 0) * 100);
-  const openingPence = Math.round(Number(shift.opening_cash || 0) * 100);
-  const restaurantCashHeldPence = openingPence + cashCollectedPence;
-
+  const rider = await myRider(req);
+  const shift = await openShift(rid(req), rider.id);
+  if (!shift) throw notFound('No open shift');
+  const stats = await periodStats(rid(req), rider.id, shift.started_at);
   ok(res, {
     shift_id: shift.id,
     started_at: shift.started_at,
-    opening_cash: openingPence,
+    opening_cash: toPence(shift.opening_cash),
     float_owner: shift.float_owner,
-    orders_delivered: ordersDelivered,
-    cash_collected: cashCollectedPence,
-    cash_tips: cashTipsPence,
-    online_tips: onlineTipsPence,
-    restaurant_cash_held: restaurantCashHeldPence,
+    orders_delivered: stats.orders,
+    cash_collected: toPence(stats.collected),
+    cash_tips: toPence(stats.cashTips),
+    online_tips: toPence(stats.onlineTips),
+    restaurant_cash_held: toPence((Number(shift.opening_cash) || 0) + stats.collected),
     generated_at: new Date().toISOString(),
   });
 }));
 
-/** 15. GET /api/v1/deliveryman/shifts */
 router.get('/shifts', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { date } = req.query;
-
-  const params = [r, riderId];
-  let where = 'restaurant_id = $1 AND deliveryman_id = $2 AND status = \'ended\'';
-  if (date) {
-    params.push(date);
-    where += ` AND DATE(started_at) = $${params.length}`;
+  const rider = await myRider(req);
+  const params = [rid(req), rider.id];
+  let dateSql = '';
+  if (req.query.date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date))) throw badRequest('date must be YYYY-MM-DD');
+    params.push(String(req.query.date));
+    dateSql = `AND started_at::date = $${params.length}::date`;
   }
-
   const { rows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts WHERE ${where} ORDER BY started_at DESC LIMIT 50`,
-    params
+    `SELECT * FROM rider_shifts WHERE restaurant_id = $1 AND deliveryman_id = $2 AND ended_at IS NOT NULL ${dateSql} ORDER BY started_at DESC`,
+    params,
   );
-
-  ok(res, rows.map((s) => ({
-    id: s.id,
-    started_at: s.started_at,
-    ended_at: s.ended_at,
-    opening_cash: Math.round(Number(s.opening_cash) * 100),
-    actual_closing: Math.round(Number(s.actual_closing) * 100),
-    expected_closing: Math.round(Number(s.expected_closing) * 100),
-    variance: Math.round(Number(s.variance) * 100),
-    restaurant_due: Math.round(Number(s.restaurant_due) * 100),
-    orders: s.orders_count,
-    cash_collected: Math.round(Number(s.cash_collected) * 100),
-    cash_tips: Math.round(Number(s.cash_tips) * 100),
-    online_tips: Math.round(Number(s.online_tips) * 100),
-    z_number: s.z_number,
-    note: s.note,
-  })));
+  ok(res, rows.map(shiftView));
 }));
 
-/** 16. GET /api/v1/deliveryman/shifts/:shiftId/z-report */
 router.get('/shifts/:shiftId/z-report', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
+  const rider = await myRider(req);
   const { rows } = await pool.query(
-    `SELECT * FROM deliveryman_shifts
-     WHERE id = $1 AND restaurant_id = $2 AND deliveryman_id = $3
-     LIMIT 1`,
-    [req.params.shiftId, r, riderId]
+    'SELECT * FROM rider_shifts WHERE id = $1 AND restaurant_id = $2 AND deliveryman_id = $3 AND ended_at IS NOT NULL',
+    [req.params.shiftId, rid(req), rider.id],
   );
-  if (!rows[0]) throw notFound('Shift record not found');
-  const s = rows[0];
-
-  ok(res, {
-    id: s.id,
-    z_number: s.z_number,
-    started_at: s.started_at,
-    ended_at: s.ended_at,
-    opening_cash: Math.round(Number(s.opening_cash) * 100),
-    actual_closing: Math.round(Number(s.actual_closing) * 100),
-    expected_closing: Math.round(Number(s.expected_closing) * 100),
-    variance: Math.round(Number(s.variance) * 100),
-    restaurant_due: Math.round(Number(s.restaurant_due) * 100),
-    orders: s.orders_count,
-    cash_collected: Math.round(Number(s.cash_collected) * 100),
-    cash_tips: Math.round(Number(s.cash_tips) * 100),
-    online_tips: Math.round(Number(s.online_tips) * 100),
-    note: s.note,
-  });
+  if (!rows[0]) throw notFound('Closed shift not found');
+  ok(res, shiftView(rows[0]));
 }));
 
-function projectDeliverymanOrder(order) {
-  const cust = order.customer || {};
-  const isCash = String(order.payment_method || '').toLowerCase().includes('cash');
-  const totalPence = Math.round(Number(order.total || 0) * 100);
-  const items = Array.isArray(order.items)
-    ? order.items.map((it) => `${it.quantity || it.qty || 1} × ${it.name || it.title || 'Item'}`)
-    : [];
+/* ---------- Orders ---------- */
 
-  let statusOut = order.status;
-  if (statusOut === 'ready_for_serve') statusOut = 'ready';
-  else if (statusOut === 'failed_to_deliver') statusOut = 'failed';
-
-  return {
-    id: String(order.id),
-    name: cust.name || `${cust.f_name || ''} ${cust.l_name || ''}`.trim() || 'Customer',
-    address: cust.address || cust.delivery_address || 'Customer Address',
-    postcode: cust.postcode || 'G41 3NH',
-    phone: cust.phone || '07700 900456',
-    zone: order.data?.zone || 'Glasgow South · G41',
-    distance: order.driver_distance_km != null ? Number(order.driver_distance_km) : 1.4,
-    total: totalPence,
-    cashDue: isCash && order.payment_status !== 'paid' ? totalPence : 0,
-    payment: isCash ? 'Cash' : 'Card',
-    status: statusOut,
-    assigned_at: order.data?.dispatched_at || order.created_at,
-    items,
-    note: order.note || cust.delivery_instructions || 'Ring the bell. Side entrance.',
-    kitchen_note: order.data?.kitchen_note || 'Keep in hot delivery bag.',
-  };
-}
-
-/** 17. GET /api/v1/deliveryman/orders */
 router.get('/orders', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { filter = 'active' } = req.query;
-
-  const params = [r, riderId];
-  let where = 'restaurant_id = $1 AND delivery_man_id = $2';
-
-  if (filter === 'active') {
-    where += ` AND status IN ('ready_for_serve', 'picked_up', 'out_for_delivery')`;
-  } else if (filter === 'completed') {
-    where += ` AND status IN ('delivered', 'completed')`;
-  } else if (filter === 'failed') {
-    where += ` AND status IN ('failed_to_deliver', 'failed', 'canceled', 'cancelled')`;
-  }
-
+  const rider = await myRider(req);
+  const filter = String(req.query.filter || 'active');
+  const statuses = {
+    active: ACTIVE,
+    completed: ['delivered'],
+    failed: ['failed_to_deliver'],
+  }[filter];
+  if (!statuses) throw badRequest('filter must be active, completed or failed');
   const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE ${where} ORDER BY created_at DESC LIMIT 50`,
-    params
+    `SELECT o.* FROM orders o WHERE o.restaurant_id = $1 AND ${assignedTo(rider.id)} AND o.status = ANY($2::text[])
+      ORDER BY o.created_at DESC LIMIT 200`,
+    [rid(req), statuses],
   );
-
-  ok(res, rows.map((r) => projectDeliverymanOrder(r)));
+  ok(res, rows.map(riderOrder));
 }));
 
-/** 18. GET /api/v1/deliveryman/orders/:orderId */
 router.get('/orders/:orderId', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 AND delivery_man_id = $3 LIMIT 1`,
-    [req.params.orderId, r, riderId]
-  );
-  if (!rows[0]) throw notFound('Order not found or not assigned to you');
-
-  ok(res, projectDeliverymanOrder(rows[0]));
+  const { order } = await myOrder(req);
+  ok(res, riderOrder(order));
 }));
 
-/** 19. PATCH /api/v1/deliveryman/orders/:orderId/pickup */
 router.patch('/orders/:orderId/pickup', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 AND delivery_man_id = $3 LIMIT 1`,
-    [req.params.orderId, r, riderId]
-  );
-  if (!rows[0]) throw notFound('Order not found');
-  const order = rows[0];
-
-  const history = Array.isArray(order.history) ? [...order.history] : [];
-  history.push({
-    status: 'picked_up',
-    at: new Date().toISOString(),
-    by: `Rider ${req.user?.name || riderId}`,
-  });
-
-  const { rows: updated } = await pool.query(
-    `UPDATE orders
-     SET status = 'picked_up', history = $3, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2
-     RETURNING *`,
-    [req.params.orderId, r, JSON.stringify(history)]
-  );
-
-  await logRiderEvent(r, riderId, 'pickup', `Order #${req.params.orderId} Picked Up`, null, req.params.orderId);
-
-  ok(res, {
-    order_id: String(req.params.orderId),
-    status: 'picked_up',
-    updated_at: updated[0].updated_at,
-  });
-}));
-
-/** 20. PATCH /api/v1/deliveryman/orders/:orderId/start-delivery */
-router.patch('/orders/:orderId/start-delivery', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 AND delivery_man_id = $3 LIMIT 1`,
-    [req.params.orderId, r, riderId]
-  );
-  if (!rows[0]) throw notFound('Order not found');
-  const order = rows[0];
-
-  const history = Array.isArray(order.history) ? [...order.history] : [];
-  history.push({
-    status: 'out_for_delivery',
-    at: new Date().toISOString(),
-    by: `Rider ${req.user?.name || riderId}`,
-  });
-
-  const { rows: updated } = await pool.query(
-    `UPDATE orders
-     SET status = 'out_for_delivery', history = $3, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2
-     RETURNING *`,
-    [req.params.orderId, r, JSON.stringify(history)]
-  );
-
-  await logRiderEvent(r, riderId, 'delivery_started', `Out for Delivery: #${req.params.orderId}`, null, req.params.orderId);
-
-  ok(res, {
-    order_id: String(req.params.orderId),
-    status: 'out_for_delivery',
-    updated_at: updated[0].updated_at,
-  });
-}));
-
-/** 21. POST /api/v1/deliveryman/orders/:orderId/complete */
-router.post('/orders/:orderId/complete', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 AND delivery_man_id = $3 LIMIT 1`,
-    [req.params.orderId, r, riderId]
-  );
-  if (!rows[0]) throw notFound('Order not found');
-  const order = rows[0];
-
-  const { cash_received = false, tip_amount = 0, tip_method = 'cash', rating, note, delivery_photo } = req.body || {};
-  const deliveredAt = new Date().toISOString();
-
-  const history = Array.isArray(order.history) ? [...order.history] : [];
-  history.push({
-    status: 'delivered',
-    at: deliveredAt,
-    by: `Rider ${req.user?.name || riderId}`,
-  });
-
-  const orderData = parseData(order.data);
-  if (delivery_photo) {
-    orderData.pod = {
-      photo_url: delivery_photo,
-      recorded_at: deliveredAt,
-      rider_id: riderId,
-      notes: note || null,
-    };
-  }
-  if (tip_amount > 0) {
-    orderData.rider_tip = Number(tip_amount) / 100;
-    orderData.tip_method = tip_method;
-  }
-  if (cash_received) {
-    orderData.cash_collected = {
-      amount: Number(order.total),
-      collected_at: deliveredAt,
-      rider_id: riderId,
-    };
-  }
-
-  const paymentStatus = cash_received ? 'paid' : order.payment_status;
-
-  const { rows: updated } = await pool.query(
-    `UPDATE orders
-     SET status = 'delivered', payment_status = $3, history = $4, data = $5::jsonb, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2
-     RETURNING *`,
-    [req.params.orderId, r, paymentStatus, JSON.stringify(history), JSON.stringify(orderData)]
-  );
-
-  // If customer rating supplied, record review
-  if (rating != null) {
-    const revId = `dm_rev_${Date.now()}`;
-    await pool.query(
-      `INSERT INTO deliveryman_reviews (id, restaurant_id, deliveryman_id, order_id, customer_id, rating, review_note, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-       ON CONFLICT DO NOTHING`,
-      [revId, r, riderId, order.id, order.customer_id || null, Number(rating), note || 'Delivered successfully']
-    ).catch(() => { });
-  }
-
-  // Trigger ledger engine
-  const ordersRouter = require('./orders');
-  if (ordersRouter.applyOrderEngines) {
-    await ordersRouter.applyOrderEngines(r, updated[0], { prevPayment: order.payment_status });
-  }
-
-  await logRiderEvent(r, riderId, 'delivery_completed', `Delivered Order #${req.params.orderId}`, Number(order.total), req.params.orderId);
-
-  ok(res, {
-    order_id: String(req.params.orderId),
-    status: 'delivered',
-    delivered_at: deliveredAt,
-  });
-}));
-
-/** 22. POST /api/v1/deliveryman/orders/:orderId/report-issue */
-router.post('/orders/:orderId/report-issue', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  const { rows } = await pool.query(
-    `SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 AND delivery_man_id = $3 LIMIT 1`,
-    [req.params.orderId, r, riderId]
-  );
-  if (!rows[0]) throw notFound('Order not found');
-  const order = rows[0];
-
-  const { reason = 'Issue reported', outcome = 'failed', note = '' } = req.body || {};
+  const { order } = await myOrder(req);
+  if (order.status !== 'ready_for_serve') throw badRequest(`Only ready orders can be picked up (this one is ${order.status})`);
   const at = new Date().toISOString();
-
-  const history = Array.isArray(order.history) ? [...order.history] : [];
-  const statusOut = outcome === 'failed' ? 'failed_to_deliver' : order.status;
-
-  history.push({
-    status: statusOut,
-    at,
-    by: `Rider Issue: ${reason}`,
-  });
-
-  const orderData = parseData(order.data);
-  const issues = Array.isArray(orderData.issues) ? orderData.issues : [];
-  issues.push({ reason, note, outcome, at, rider_id: riderId });
-  orderData.issues = issues;
-
-  await pool.query(
-    `UPDATE orders
-     SET status = $3, history = $4, data = $5::jsonb, updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2`,
-    [req.params.orderId, r, statusOut, JSON.stringify(history), JSON.stringify(orderData)]
-  );
-
-  await logRiderEvent(r, riderId, 'delivery_failed', `Delivery Failed: #${req.params.orderId}`, null, req.params.orderId, null, {
-    reason,
-    note,
-  });
-
-  ok(res, {
-    order_id: String(req.params.orderId),
-    status: 'failed',
-    failure: {
-      reason,
-      note,
-      at,
-      by: req.user?.name || 'Alex Rider',
-    },
-  });
+  await setOrderData(order.id, rid(req), { picked_up_at: at });
+  // The order status stays ready_for_serve until the rider starts the delivery. The kitchen status set has no picked_up state.
+  ok(res, { id: String(order.id), status: order.status, picked_up_at: at });
 }));
 
-/** 23. GET /api/v1/deliveryman/cash/summary */
+router.patch('/orders/:orderId/start-delivery', asyncHandler(async (req, res) => {
+  const { order } = await myOrder(req);
+  const updated = await changeOrderStatus(req, order.id, 'out_for_delivery', null);
+  const at = new Date().toISOString();
+  await setOrderData(order.id, rid(req), { out_for_delivery_at: at });
+  ok(res, { id: String(updated.id), status: updated.status, out_for_delivery_at: at });
+}));
+
+router.post('/orders/:orderId/complete', asyncHandler(async (req, res) => {
+  const { order } = await myOrder(req);
+  const body = req.body || {};
+  const cashPence = body.cash_collected == null ? 0 : Number(body.cash_collected);
+  const tipPence = body.tip_amount == null ? 0 : Number(body.tip_amount);
+  if (!Number.isInteger(cashPence) || cashPence < 0) throw badRequest('cash_collected must be whole pence, zero or more');
+  if (!Number.isInteger(tipPence) || tipPence < 0) throw badRequest('tip_amount must be whole pence, zero or more');
+  const rating = body.rating == null ? null : Number(body.rating);
+  if (rating !== null && (!Number.isInteger(rating) || rating < 1 || rating > 5)) throw badRequest('rating must be 1 to 5');
+  const at = new Date().toISOString();
+  const updated = await changeOrderStatus(req, order.id, 'delivered', body.notes ? String(body.notes).slice(0, 500) : null);
+  await setOrderData(order.id, rid(req), {
+    delivered_at: at,
+    cash_collected: toPounds(cashPence),
+    tip_amount: toPounds(tipPence),
+    rating,
+    delivery_notes: body.notes ? String(body.notes).slice(0, 500) : null,
+  });
+  ok(res, { id: String(updated.id), status: updated.status, delivered_at: at, cash_collected: cashPence, tip_amount: tipPence, rating });
+}));
+
+router.post('/orders/:orderId/report-issue', asyncHandler(async (req, res) => {
+  const { order } = await myOrder(req);
+  const body = req.body || {};
+  const issue = body.issue_type ? String(body.issue_type).slice(0, 60) : 'other';
+  const notes = body.notes ? String(body.notes).slice(0, 500) : null;
+  const at = new Date().toISOString();
+  const rider = await myRider(req);
+  const updated = await changeOrderStatus(req, order.id, 'failed_to_deliver', `${issue}${notes ? `: ${notes}` : ''}`);
+  await setOrderData(order.id, rid(req), { failure: { reason: issue, note: notes, at, by: rider.name } });
+  ok(res, { order_id: String(updated.id), status: updated.status, failure: { reason: issue, note: notes, at, by: rider.name } });
+}));
+
+/* ---------- Cash ---------- */
+
 router.get('/cash/summary', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
-  // Active shift opening float
-  const { rows: shiftRows } = await pool.query(
-    `SELECT opening_cash, float_owner FROM deliveryman_shifts
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'active'
-     ORDER BY started_at DESC LIMIT 1`,
-    [r, riderId]
-  );
-  const shiftFloatHeldPence = Math.round(Number(shiftRows[0]?.opening_cash || 0) * 100);
-
-  // Today's collected cash & tips
-  const { rows: todayStats } = await pool.query(
-    `SELECT COALESCE(SUM(CASE WHEN payment_method ILIKE '%cash%' OR data->>'cash_collected' IS NOT NULL THEN total ELSE 0 END), 0)::numeric AS collected_today,
-            COALESCE(SUM(CASE WHEN data->>'cash_tip' IS NOT NULL THEN (data->>'cash_tip')::numeric ELSE 0 END), 0)::numeric AS cash_tips,
-            COALESCE(SUM(COALESCE(tip, 0)), 0)::numeric AS online_tips,
-            COUNT(*)::int AS orders_count
-     FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2
-       AND status IN ('delivered', 'completed')
-       AND DATE(updated_at) = CURRENT_DATE`,
-    [r, riderId]
-  );
-
-  const collectedTodayPence = Math.round(Number(todayStats[0]?.collected_today || 0) * 100);
-  const cashTipsPence = Math.round(Number(todayStats[0]?.cash_tips || 0) * 100);
-  const onlineTipsPence = Math.round(Number(todayStats[0]?.online_tips || 0) * 100);
-  const ordersCount = todayStats[0]?.orders_count || 0;
-  const deliveryPayPence = ordersCount * 250; // default base pay per drop
-
-  // Handovers
-  const { rows: hoRows } = await pool.query(
-    `SELECT status, COALESCE(SUM(amount), 0)::numeric AS sum_amt
-     FROM deliveryman_handovers
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND DATE(created_at) = CURRENT_DATE
-     GROUP BY status`,
-    [r, riderId]
-  );
-
-  let pendingHandoversPence = 0;
-  let confirmedHandoversPence = 0;
-  for (const ho of hoRows) {
-    if (ho.status === 'confirmed') confirmedHandoversPence += Math.round(Number(ho.sum_amt) * 100);
-    else if (ho.status === 'pending_confirmation') pendingHandoversPence += Math.round(Number(ho.sum_amt) * 100);
-  }
-
-  const heldOrderCashPence = Math.max(0, collectedTodayPence - confirmedHandoversPence);
-  const restaurantCashHeldPence = shiftFloatHeldPence + heldOrderCashPence;
-  const physicalCashPence = restaurantCashHeldPence + cashTipsPence;
-
-  ok(res, {
-    restaurant_cash_held: restaurantCashHeldPence,
-    held_order_cash: heldOrderCashPence,
-    restaurant_float_held: shiftFloatHeldPence,
-    physical_cash: physicalCashPence,
-    pending_handovers: pendingHandoversPence,
-    collected_today: collectedTodayPence,
-    confirmed_handovers: confirmedHandoversPence,
-    cash_tips: cashTipsPence,
-    online_tips: onlineTipsPence,
-    delivery_pay: deliveryPayPence,
-  });
+  const rider = await myRider(req);
+  const { summary } = await cashPosition(rid(req), rider);
+  ok(res, summary);
 }));
 
-/** 24. POST /api/v1/deliveryman/cash/handover */
 router.post('/cash/handover', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { amount, reference = '' } = req.body || {};
-
-  const numAmount = Number(amount);
-  if (isNaN(numAmount) || numAmount <= 0) {
-    throw badRequest('Handover amount must be a positive number');
-  }
-
-  const handoverId = `event-${Date.now()}`;
-  const amountDecimal = numAmount > 100 ? (numAmount / 100) : numAmount;
-
+  const amount = Number((req.body || {}).amount);
+  if (!Number.isInteger(amount) || amount <= 0) throw badRequest('amount must be a whole number of pence above zero');
+  const reference = (req.body || {}).reference ? String((req.body || {}).reference).slice(0, 200) : null;
+  const rider = await myRider(req);
+  const restaurant = rid(req);
+  const position = await cashPosition(restaurant, rider);
+  if (amount > position.summary.physical_cash) throw badRequest('Amount is more than the cash you hold');
+  const id = `event-${Date.now()}`;
+  const at = new Date().toISOString();
   await pool.query(
-    `INSERT INTO deliveryman_handovers (id, restaurant_id, deliveryman_id, amount, reference, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, 'pending_confirmation', NOW(), NOW())`,
-    [handoverId, r, riderId, amountDecimal, reference]
+    'INSERT INTO rider_cash_handovers (id, restaurant_id, deliveryman_id, shift_id, amount, reference, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+    [id, restaurant, rider.id, position.shift ? position.shift.id : null, toPounds(amount), reference, 'pending_confirmation', at],
   );
-
-  await logRiderEvent(r, riderId, 'handover_submitted', `Cash Handover: £${amountDecimal.toFixed(2)}`, amountDecimal, null, null, {
-    reference,
-  });
-
-  ok(res, {
-    handover_id: handoverId,
-    amount: numAmount,
-    status: 'pending_confirmation',
-    at: new Date().toISOString(),
-  });
+  created(res, { handover_id: id, amount, status: 'pending_confirmation', at });
 }));
 
-/** 25. GET /api/v1/deliveryman/cash/handovers */
 router.get('/cash/handovers', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-
+  const rider = await myRider(req);
   const { rows } = await pool.query(
-    `SELECT * FROM deliveryman_handovers
-     WHERE restaurant_id = $1 AND deliveryman_id = $2
-     ORDER BY created_at DESC LIMIT 50`,
-    [r, riderId]
+    'SELECT * FROM rider_cash_handovers WHERE restaurant_id = $1 AND deliveryman_id = $2 ORDER BY created_at DESC LIMIT 200',
+    [rid(req), rider.id],
   );
-
-  ok(res, rows.map((ho) => ({
-    handover_id: ho.id,
-    amount: Math.round(Number(ho.amount) * 100),
-    reference: ho.reference,
-    status: ho.status,
-    at: ho.created_at,
-    confirmed_at: ho.confirmed_at,
+  ok(res, rows.map((h) => ({
+    handover_id: h.id,
+    amount: toPence(h.amount),
+    reference: h.reference,
+    status: h.status,
+    at: h.created_at,
+    confirmed_at: h.confirmed_at,
   })));
 }));
 
-/** Helper: POST /api/v1/deliveryman/cash/handovers/:id/confirm */
 router.post('/cash/handovers/:id/confirm', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const { rows } = await pool.query(
-    `UPDATE deliveryman_handovers
-     SET status = 'confirmed', confirmed_by = $3, confirmed_at = NOW(), updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2
-     RETURNING *`,
-    [req.params.id, r, req.user?.name || 'Manager']
-  );
-  if (!rows[0]) throw notFound('Handover not found');
-  ok(res, rows[0]);
+  const restaurant = rid(req);
+  const client = await pool.connect();
+  let row;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      "SELECT * FROM rider_cash_handovers WHERE id = $1 AND restaurant_id = $2 AND status = 'pending_confirmation' FOR UPDATE",
+      [req.params.id, restaurant],
+    );
+    if (!rows[0]) throw notFound('No pending handover with that id');
+    row = rows[0];
+    const confirmedBy = req.user?.name || req.user?.email || 'Restaurant';
+    const confirmedAt = new Date().toISOString();
+    await client.query(
+      "UPDATE rider_cash_handovers SET status = 'confirmed', confirmed_at = $2, confirmed_by = $3 WHERE id = $1",
+      [row.id, confirmedAt, confirmedBy],
+    );
+    // The confirmed amount is recorded in the restaurant's rider settlements, so the reports match the cash.
+    await client.query(
+      `INSERT INTO driver_cash_settlements (id, restaurant_id, driver_id, settle_date, amount, note, created_by)
+       VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6)`,
+      [`dcs_${row.id}`, restaurant, row.deliveryman_id, row.amount, `Handover ${row.id}${row.reference ? `: ${row.reference}` : ''}`, confirmedBy],
+    );
+    await client.query('COMMIT');
+    row = { ...row, status: 'confirmed', confirmed_at: confirmedAt, confirmed_by: confirmedBy };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  ok(res, { id: row.id, amount: Number(row.amount).toFixed(2), status: 'confirmed', confirmed_by: row.confirmed_by, confirmed_at: row.confirmed_at });
 }));
 
-/** 26. GET /api/v1/deliveryman/history/daily-summary */
+/* ---------- History and events ---------- */
+
 router.get('/history/daily-summary', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const queryDate = req.query.date || new Date().toISOString().slice(0, 10);
-
-  const { rows: stats } = await pool.query(
-    `SELECT COUNT(*)::int AS delivered_orders,
-            COALESCE(SUM(CASE WHEN payment_method ILIKE '%cash%' OR data->>'cash_collected' IS NOT NULL THEN total ELSE 0 END), 0)::numeric AS customer_cash,
-            COALESCE(SUM(CASE WHEN data->>'cash_tip' IS NOT NULL THEN (data->>'cash_tip')::numeric ELSE 0 END), 0)::numeric AS cash_tips,
-            COALESCE(SUM(COALESCE(tip, 0)), 0)::numeric AS online_tips
-     FROM orders
-     WHERE restaurant_id = $1 AND delivery_man_id = $2
-       AND status IN ('delivered', 'completed')
-       AND DATE(updated_at) = $3`,
-    [r, riderId, queryDate]
+  const rider = await myRider(req);
+  const date = req.query.date ? String(req.query.date) : new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest('date must be YYYY-MM-DD');
+  const { rows } = await pool.query(
+    `SELECT o.payment_method, o.data FROM orders o
+      WHERE o.restaurant_id = $1 AND ${assignedTo(rider.id)} AND o.status = 'delivered'
+        AND (o.data->>'delivered_at')::date = $2::date`,
+    [rid(req), date],
   );
-
-  const { rows: hoRows } = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0)::numeric AS confirmed_handovers
-     FROM deliveryman_handovers
-     WHERE restaurant_id = $1 AND deliveryman_id = $2 AND status = 'confirmed' AND DATE(created_at) = $3`,
-    [r, riderId, queryDate]
-  );
-
-  const s = stats[0] || {};
+  let collected = 0;
+  let cashTips = 0;
+  let onlineTips = 0;
+  for (const r of rows) {
+    const d = r.data || {};
+    if (r.payment_method === 'cash') collected += Number(d.cash_collected) || 0;
+    if (r.payment_method === 'cash') cashTips += Number(d.tip_amount) || 0;
+    else onlineTips += Number(d.tip_amount) || 0;
+  }
   ok(res, {
-    date: queryDate,
-    delivered_orders: s.delivered_orders || 0,
-    customer_cash_received: Math.round(Number(s.customer_cash || 0) * 100),
-    cash_tips: Math.round(Number(s.cash_tips || 0) * 100),
-    online_tips: Math.round(Number(s.online_tips || 0) * 100),
-    confirmed_handovers: Math.round(Number(hoRows[0]?.confirmed_handovers || 0) * 100),
+    date,
+    orders_count: rows.length,
+    cash_collected: toPence(collected),
+    cash_tips: toPence(cashTips),
+    online_tips: toPence(onlineTips),
+    total_tips: toPence(cashTips + onlineTips),
   });
 }));
 
-/** 27. GET /api/v1/deliveryman/events */
-router.get('/events', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { date, shift_id } = req.query;
-
-  const params = [r, riderId];
-  let where = 'restaurant_id = $1 AND deliveryman_id = $2';
-  if (shift_id) {
-    params.push(shift_id);
-    where += ` AND shift_id = $${params.length}`;
-  }
-  if (date) {
-    params.push(date);
-    where += ` AND DATE(created_at) = $${params.length}`;
-  }
-
-  const { rows } = await pool.query(
-    `SELECT * FROM deliveryman_events WHERE ${where} ORDER BY created_at DESC LIMIT 100`,
-    params
+router.get('/history/statement', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const from = req.query.from ? String(req.query.from) : new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const to = req.query.to ? String(req.query.to) : new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw badRequest('from and to must be YYYY-MM-DD');
+  const restaurant = rid(req);
+  const { rows: orders } = await pool.query(
+    `SELECT o.id, o.total, o.data, o.payment_method, o.status, (o.data->>'delivered_at')::timestamptz AS at FROM orders o
+      WHERE o.restaurant_id = $1 AND ${assignedTo(rider.id)} AND o.status = 'delivered'
+        AND (o.data->>'delivered_at')::date BETWEEN $2::date AND $3::date`,
+    [restaurant, from, to],
   );
-
-  ok(res, rows);
+  const { rows: handovers } = await pool.query(
+    'SELECT * FROM rider_cash_handovers WHERE restaurant_id = $1 AND deliveryman_id = $2 AND created_at::date BETWEEN $3::date AND $4::date',
+    [restaurant, rider.id, from, to],
+  );
+  const items = [
+    ...orders.map((o) => ({
+      id: `stmt_${o.id}`,
+      date: new Date(o.at).toISOString().slice(0, 10),
+      type: 'delivery',
+      reference: `Order #${o.id}`,
+      amount: toPence(o.total),
+      tip: toPence(o.data?.tip_amount),
+      status: o.status,
+      at: o.at,
+    })),
+    ...handovers.map((h) => ({
+      id: `stmt_${h.id}`,
+      date: new Date(h.created_at).toISOString().slice(0, 10),
+      type: 'handover',
+      reference: h.reference || h.id,
+      amount: toPence(h.amount),
+      tip: 0,
+      status: h.status,
+      at: h.created_at,
+    })),
+  ].sort((a, b) => new Date(b.at) - new Date(a.at));
+  ok(res, items);
 }));
 
-/** 28. GET /api/v1/deliveryman/history/statement */
-router.get('/history/statement', asyncHandler(async (req, res) => {
-  const r = rid(req);
-  const riderId = getRiderId(req);
-  const { format } = req.query;
-
-  const { rows } = await pool.query(
-    `SELECT id, event_type, title, amount, created_at, details
-     FROM deliveryman_events
-     WHERE restaurant_id = $1 AND deliveryman_id = $2
-     ORDER BY created_at DESC LIMIT 500`,
-    [r, riderId]
-  );
-
-  if (format === 'csv') {
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="deliveryman_statement.csv"');
-    let csv = 'ID,Timestamp,Event,Title,Amount\n';
-    for (const row of rows) {
-      csv += `"${row.id}","${row.created_at}","${row.event_type}","${row.title}",${row.amount || 0}\n`;
-    }
-    return res.send(csv);
+router.get('/events', asyncHandler(async (req, res) => {
+  const rider = await myRider(req);
+  const restaurant = rid(req);
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+  const [shifts, orders, handovers] = await Promise.all([
+    pool.query('SELECT * FROM rider_shifts WHERE restaurant_id = $1 AND deliveryman_id = $2 ORDER BY started_at DESC LIMIT $3', [restaurant, rider.id, limit]),
+    pool.query(
+      `SELECT o.id, o.total, o.data, (o.data->>'delivered_at')::timestamptz AS at FROM orders o
+        WHERE o.restaurant_id = $1 AND ${assignedTo(rider.id)} AND o.status = 'delivered' ORDER BY at DESC LIMIT $2`,
+      [restaurant, limit],
+    ),
+    pool.query('SELECT * FROM rider_cash_handovers WHERE restaurant_id = $1 AND deliveryman_id = $2 ORDER BY created_at DESC LIMIT $3', [restaurant, rider.id, limit]),
+  ]);
+  const events = [];
+  for (const s of shifts.rows) {
+    events.push({ id: `ev_${s.id}_start`, event_type: 'shift_started', title: 'Shift started', amount: toPence(s.opening_cash), order_id: null, shift_id: s.id, at: s.started_at, details: { float_owner: s.float_owner } });
+    if (s.ended_at) events.push({ id: `ev_${s.id}_end`, event_type: 'shift_ended', title: 'Shift ended', amount: toPence(s.actual_closing), order_id: null, shift_id: s.id, at: s.ended_at, details: { variance: toPence(s.variance) } });
   }
-
-  ok(res, rows);
+  for (const o of orders.rows) {
+    events.push({ id: `ev_${o.id}`, event_type: 'delivery_completed', title: `Delivered Order #${o.id}`, amount: toPence(o.total), order_id: String(o.id), shift_id: null, at: o.at, details: { cash_collected: toPence(o.data?.cash_collected), tip_amount: toPence(o.data?.tip_amount) } });
+  }
+  for (const h of handovers.rows) {
+    events.push({ id: h.id, event_type: h.status === 'confirmed' ? 'handover_confirmed' : 'handover_submitted', title: 'Cash handover', amount: toPence(h.amount), order_id: null, shift_id: h.shift_id, at: h.created_at, details: { status: h.status } });
+  }
+  ok(res, events.sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, limit).map((e) => ({ ...e, at: new Date(e.at).toISOString() })));
 }));
 
 module.exports = router;

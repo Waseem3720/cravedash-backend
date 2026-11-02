@@ -12,8 +12,18 @@ async function allocate(restaurantId, { from, to, by }) {
     foh_percent: 60,
     boh_percent: 40,
   });
-  const fohPct = (+cfg.foh_percent || 60) / 100;
-  const bohPct = (+cfg.boh_percent || 40) / 100;
+  // BUG-018: a configured 0 is a real value (it was replaced by the default), and the two pools must add up to all tips.
+  const percentOf = (value, fallback) => (value === undefined || value === null || value === '' ? fallback : Number(value));
+  const fohRaw = percentOf(cfg.foh_percent, 60);
+  const bohRaw = percentOf(cfg.boh_percent, 40);
+  if (!Number.isFinite(fohRaw) || !Number.isFinite(bohRaw) || fohRaw < 0 || bohRaw < 0 || fohRaw + bohRaw !== 100) {
+    const err = new Error('FOH and BOH percentages must be zero or more and add up to 100');
+    err.status = 400;
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+  const fohPct = fohRaw / 100;
+  const bohPct = bohRaw / 100;
 
   const { rows: orders } = await pool.query(
     `SELECT id, tip, created_at FROM orders

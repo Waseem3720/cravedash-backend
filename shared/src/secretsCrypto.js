@@ -2,32 +2,14 @@ const crypto = require('crypto');
 
 const PREFIX = 'enc:v1:';
 
-let warnedFallback = false;
-
 function secretKey() {
-  const explicit = process.env.INTEGRATIONS_SECRET_KEY;
-  if (process.env.NODE_ENV === 'production') {
-    if (!explicit || explicit === 'change-me-in-production' || explicit === 'dev-only-integrations-key') {
-      throw new Error('INTEGRATIONS_SECRET_KEY must be explicitly set and strong in production; falling back to JWT_SECRET is forbidden');
+  const raw = process.env.INTEGRATIONS_SECRET_KEY || process.env.JWT_SECRET;
+  if (!raw || raw === 'change-me-in-production' || raw === 'dev-only-integrations-key') {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('INTEGRATIONS_SECRET_KEY (or strong JWT_SECRET) must be set in production');
     }
-    return crypto.createHash('sha256').update(String(explicit)).digest();
   }
-
-  if (explicit && explicit !== 'change-me-in-production' && explicit !== 'dev-only-integrations-key') {
-    return crypto.createHash('sha256').update(String(explicit)).digest();
-  }
-
-  // Non-production fallback to JWT_SECRET for test/dev compatibility
-  const fallback = process.env.JWT_SECRET;
-  if (fallback && fallback !== 'change-me-in-production') {
-    if (!warnedFallback) {
-      console.warn('[secretsCrypto] WARN: INTEGRATIONS_SECRET_KEY not set; using JWT_SECRET fallback (non-production only)');
-      warnedFallback = true;
-    }
-    return crypto.createHash('sha256').update(String(fallback)).digest();
-  }
-
-  return crypto.createHash('sha256').update('dev-only-integrations-key').digest();
+  return crypto.createHash('sha256').update(String(raw || 'dev-only-integrations-key')).digest();
 }
 
 function isEncrypted(value) {

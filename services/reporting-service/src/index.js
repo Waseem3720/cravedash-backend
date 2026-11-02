@@ -3,19 +3,17 @@ require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 const { createApp } = require('@cravedash/shared/src/createApp');
 const { listenHost } = require('@cravedash/shared/src/listenHost');
-const { requireAuth } = require('@cravedash/shared/src/authMiddleware');
+const { requireAuth, requireRole } = require('@cravedash/shared/src/authMiddleware');
 const reports = require('./routes/reports');
 
 const app = createApp('reporting-service');
 const PORT = +(process.env.PORT || 4007);
 const HOST = listenHost();
 
-app.use('/api/v1', requireAuth, reports);
+// Reports are for restaurant admins and platform admins only. Chef, driver and customer tokens are refused (SEC-H3).
+app.use('/api/v1', requireAuth, requireRole('super', 'restaurant'), reports);
 
-if (require.main === module) {
-  app.listen(PORT, HOST, () => {
-    console.log(`Reporting service on http://${HOST}:${PORT}`);
-  });
-}
-
-module.exports = app;
+app.listen(PORT, HOST, () => {
+  console.log(`Reporting service on http://${HOST}:${PORT}`);
+  require('@cravedash/shared/src/db').warmPool();
+});

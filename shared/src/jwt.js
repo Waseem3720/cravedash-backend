@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
 const WEAK = new Set([
@@ -25,7 +26,9 @@ function isWeak(secret) {
 
 function resolveSecret() {
   if (!isWeak(rawSecret)) return rawSecret;
-  if (isTest) return rawSecret || 'test-jwt-secret-do-not-use-in-prod-32b';
+  // BUG-034: NODE_ENV=test no longer accepts a weak JWT_SECRET (a deployed environment could be mislabelled test).
+  // Without any secret, tests get a random per-process key, never a value committed to the source.
+  if (isTest && !rawSecret) return crypto.randomBytes(48).toString('hex');
   if (allowWeak) {
     console.warn('[jwt] ALLOW_WEAK_JWT=1 — using weak/default secret (never in production)');
     return rawSecret || 'dev-change-me';
@@ -64,26 +67,35 @@ function verify(token) {
   return jwt.verify(token, SECRET);
 }
 
+/**
+ * Browser session cookies (FE-H2). The browser holds the session as an httpOnly cookie, so page scripts cannot read
+ * the token. The gateway turns the cookie into a Bearer header, so services keep verifying the same JWT.
+ *   SESSION_COOKIE  - the signed-in session (path /api/v1).
+ *   RESTORE_COOKIE  - a super admin's own session, kept while impersonating (only sent to /api/v1/auth).
+ */
+const SESSION_COOKIE = 'cd_session';
+const RESTORE_COOKIE = 'cd_restore';
+
+/** Returns the value of one cookie from a Cookie request header, or null. */
+function readCookie(cookieHeader, name) {
+  if (!cookieHeader || typeof cookieHeader !== 'string') return null;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    if (part.slice(0, idx).trim() !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(idx + 1).trim()) || null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function verifyEposStaff(token) {
   const p = verify(token);
   if (p.typ !== 'epos_staff' || !p.staff_id) {
     const err = new Error('Invalid EPOS staff token');
-    err.name = 'JsonWebTokenError';
-    throw err;
-  }
-  return p;
-}
-
-/** Short-lived token for email verification (15 minutes default). */
-const EMAIL_VERIFY_EXPIRES = process.env.JWT_EMAIL_VERIFY_EXPIRES || '15m';
-function signEmailVerification(payload) {
-  return sign({ ...payload, typ: 'email_verification' }, { expiresIn: EMAIL_VERIFY_EXPIRES });
-}
-
-function verifyEmailVerification(token) {
-  const p = verify(token);
-  if (p.typ !== 'email_verification' || !p.sub || !p.email || !p.jti) {
-    const err = new Error('Invalid email verification token');
     err.name = 'JsonWebTokenError';
     throw err;
   }
@@ -95,14 +107,13 @@ module.exports = {
   signImpersonation,
   signMfaPending,
   signEposStaff,
-  signEmailVerification,
   verify,
   verifyEposStaff,
-  verifyEmailVerification,
+  readCookie,
+  SESSION_COOKIE,
+  RESTORE_COOKIE,
   SECRET,
   EXPIRES,
   IMPERSONATE_EXPIRES,
   EPOS_STAFF_EXPIRES,
-  EMAIL_VERIFY_EXPIRES,
 };
-

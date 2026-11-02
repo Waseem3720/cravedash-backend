@@ -1,11 +1,13 @@
 const express = require('express');
-const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const pool = require('@cravedash/shared/src/db');
-const { buildCrud } = require('@cravedash/shared/src/crud');
+const accounting = require('@cravedash/shared/src/engines/accounting');
+const { buildCrud, removeWithDependants } = require('@cravedash/shared/src/crud');
 const { ok, created } = require('@cravedash/shared/src/response');
 const asyncHandler = require('@cravedash/shared/src/asyncHandler');
 const { notFound, forbidden, badRequest } = require('@cravedash/shared/src/errors');
-const { restaurantId } = require('@cravedash/shared/src/authMiddleware');
+const { restaurantId, branchId } = require('@cravedash/shared/src/authMiddleware');
+const { idempotent } = require('@cravedash/shared/src/idempotency');
 const { clearStripeCache } = require('@cravedash/shared/src/stripeClient');
 const stripeOps = require('./stripeOps');
 
@@ -55,6 +57,73 @@ function flattenRestaurant(row) {
   return out;
 }
 
+/**
+ * Coerce an incoming status value to the boolean the DB column expects.
+ * Accepts true/false, "true"/"false", "active"/"inactive", 1/0. undefined = not supplied, null = null.
+ */
+function toStatusBool(value, field = 'status') {
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || value === 0) return value === 1;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === 'true' || v === 'active' || v === '1') return true;
+    if (v === 'false' || v === 'inactive' || v === '0') return false;
+  }
+  throw badRequest(`${field} must be true/false, "active"/"inactive", or 1/0`);
+}
+
+function isNonEmptyString(v) {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/** Non-negative number (accepts numeric strings). undefined = not supplied; null only if allowNull. */
+function toNonNegativeNumber(value, field, allowNull = false) {
+  if (value === undefined) return undefined;
+  if (value === null && allowNull) return null;
+  const n = typeof value === 'number' ? value : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+  if (!Number.isFinite(n) || n < 0) throw badRequest(`${field} must be a number >= 0`);
+  return n;
+}
+
+function preparePlanBody(body, { create }) {
+  const b = { ...(body || {}) };
+  if (create) {
+    if (!isNonEmptyString(b.name)) throw badRequest('name is required');
+    if (b.price_monthly === undefined) throw badRequest('price_monthly is required');
+  } else if (b.name !== undefined && !isNonEmptyString(b.name)) {
+    throw badRequest('name must be a non-empty string');
+  }
+  if ('price_monthly' in b) b.price_monthly = toNonNegativeNumber(b.price_monthly, 'price_monthly');
+  if ('price_yearly' in b) b.price_yearly = toNonNegativeNumber(b.price_yearly, 'price_yearly', true);
+  if ('status' in b) b.status = toStatusBool(b.status);
+  return b;
+}
+
+/** platform_admins.perms is jsonb. "ALL" is stored as the JSON string "ALL" (read back as "ALL", which
+ *  adminPerms() in the frontend and the rest of the code already expect); arrays are stored as JSON arrays. */
+function normalisePerms(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === 'string') {
+    if (value.trim().toUpperCase() === 'ALL') return JSON.stringify('ALL');
+    throw badRequest('perms must be "ALL", an array of permission keys, or null');
+  }
+  if (Array.isArray(value) && value.every((x) => typeof x === 'string')) return value;
+  throw badRequest('perms must be "ALL", an array of permission keys, or null');
+}
+
+function prepareAdminBody(body, { create }) {
+  const b = { ...(body || {}) };
+  if (create) {
+    if (!isNonEmptyString(b.name)) throw badRequest('name is required');
+    if (!isNonEmptyString(b.email)) throw badRequest('email is required');
+  }
+  if ('status' in b) b.status = toStatusBool(b.status);
+  if ('perms' in b) b.perms = normalisePerms(b.perms);
+  return b;
+}
+
 function prepareRestaurantBody(body, existing) {
   const topCols = new Set(['name', 'owner', 'email', 'phone', 'plan_id', 'sub_status', 'status', 'address', 'city', 'live_id']);
   const existingData = existing?.data && typeof existing.data === 'object' ? existing.data : {};
@@ -67,7 +136,8 @@ function prepareRestaurantBody(body, existing) {
 
   Object.entries(body || {}).forEach(([k, v]) => {
     if (k === 'data' || k === 'id') return;
-    if (topCols.has(k)) top[k] = v;
+    if (k === 'status') top.status = toStatusBool(v);
+    else if (topCols.has(k)) top[k] = v;
     else if (RESTAURANT_DATA_KEYS.has(k) || k.startsWith('pay_') || k.startsWith('stripe_')) {
       nextData[k] = v;
     } else {
@@ -77,6 +147,21 @@ function prepareRestaurantBody(body, existing) {
 
   top.data = nextData;
   return top;
+}
+
+/**
+ * Phase 2 limit: a branch's services must be a subset of the restaurant's services. A branch with no services list
+ * inherits the restaurant's full list, so only an explicit list is checked here.
+ */
+function assertBranchServicesWithinRestaurant(data) {
+  const branches = Array.isArray(data?.branch_list) ? data.branch_list : [];
+  const allowed = new Set(Array.isArray(data?.services) ? data.services.map(String) : []);
+  for (const b of branches) {
+    if (!b || !Array.isArray(b.services)) continue;
+    if (b.services.some((s) => !allowed.has(String(s)))) {
+      throw badRequest(`Branch "${b.name || b.id}" has a service the restaurant does not have`);
+    }
+  }
 }
 
 function mountGlobal(path, table, opts = {}) {
@@ -93,19 +178,38 @@ function mountGlobal(path, table, opts = {}) {
     if (!row) throw notFound();
     ok(res, row);
   }));
+  const prep = (body, create) => (opts.prepare ? opts.prepare(body || {}, { create }) : body);
   router.post(path, asyncHandler(async (req, res) => {
-    const body = { ...req.body };
+    const body = { ...prep(req.body, true) };
     if (!body.id) body.id = `${table.slice(0, 3)}_${Date.now().toString(36)}`;
     created(res, await crud.create(body, null));
   }));
-  router.put(`${path}/:id`, asyncHandler(async (req, res) => ok(res, await crud.update(req.params.id, req.body, null))));
-  router.patch(`${path}/:id`, asyncHandler(async (req, res) => ok(res, await crud.update(req.params.id, req.body, null))));
-  router.delete(`${path}/:id`, asyncHandler(async (req, res) => ok(res, await crud.remove(req.params.id, null))));
+  router.put(`${path}/:id`, asyncHandler(async (req, res) => ok(res, await crud.update(req.params.id, prep(req.body, false), null))));
+  router.patch(`${path}/:id`, asyncHandler(async (req, res) => ok(res, await crud.update(req.params.id, prep(req.body, false), null))));
+  // SEC-M8: opts.dependants refuses the delete with 409 and counts while rows still reference this one.
+  router.delete(`${path}/:id`, asyncHandler(async (req, res) => {
+    if (opts.dependants) {
+      return ok(res, await removeWithDependants(pool, {
+        table,
+        id: req.params.id,
+        restaurantColumn: null,
+        dependants: opts.dependants,
+      }));
+    }
+    return ok(res, await crud.remove(req.params.id, null));
+  }));
 }
 
-mountGlobal('/plans', 'plans', { jsonColumns: ['features', 'data'] });
+mountGlobal('/plans', 'plans', {
+  jsonColumns: ['features', 'data'],
+  prepare: preparePlanBody,
+  dependants: [
+    { table: 'restaurants', column: 'plan_id', label: 'restaurants', restaurantColumn: null },
+    { table: 'subscriptions', column: 'plan_id', label: 'subscriptions', restaurantColumn: null },
+  ],
+});
 mountGlobal('/subscriptions', 'subscriptions', { jsonColumns: ['data'] });
-mountGlobal('/admins', 'platform_admins', { jsonColumns: ['perms'] });
+mountGlobal('/admins', 'platform_admins', { jsonColumns: ['perms'], prepare: prepareAdminBody });
 
 const restaurantsCrud = buildCrud(pool, 'restaurants', {
   jsonColumns: ['data'],
@@ -123,29 +227,77 @@ router.get('/restaurants/:id', asyncHandler(async (req, res) => {
   ok(res, flattenRestaurant(row));
 }));
 
+// Next plain numeric restaurant id (17, 18, …). Legacy `r`-prefixed ids are counted too.
+// A concurrent duplicate fails on the primary key, it never overwrites.
+async function nextRestaurantId() {
+  const { rows } = await pool.query(
+    "SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(id, '^r', '') AS INTEGER)), 0) + 1 AS next FROM restaurants WHERE id ~ '^r?[0-9]+$'",
+  );
+  return String(rows[0].next);
+}
+
 router.post('/restaurants', asyncHandler(async (req, res) => {
   const body = { ...req.body };
-  if (!body.id) body.id = `r${Date.now().toString(36)}`;
+  if (!isNonEmptyString(body.name)) throw badRequest('name is required');
+  if (!body.id) body.id = await nextRestaurantId();
   const prepared = prepareRestaurantBody(body, { data: {} });
+  assertBranchServicesWithinRestaurant(prepared.data);
+  prepared.id = body.id; // prepareRestaurantBody drops id; a create must keep it
   created(res, flattenRestaurant(await restaurantsCrud.create(prepared, null)));
 }));
 
 router.put('/restaurants/:id', asyncHandler(async (req, res) => {
   const existing = await restaurantsCrud.getById(req.params.id, null);
   if (!existing) throw notFound();
+  if (req.body?.name !== undefined && !isNonEmptyString(req.body.name)) throw badRequest('name must be a non-empty string');
   const prepared = prepareRestaurantBody(req.body, existing);
+  assertBranchServicesWithinRestaurant(prepared.data);
   ok(res, flattenRestaurant(await restaurantsCrud.update(req.params.id, prepared, null)));
 }));
 
 router.patch('/restaurants/:id', asyncHandler(async (req, res) => {
   const existing = await restaurantsCrud.getById(req.params.id, null);
   if (!existing) throw notFound();
+  if (req.body?.name !== undefined && !isNonEmptyString(req.body.name)) throw badRequest('name must be a non-empty string');
   const prepared = prepareRestaurantBody(req.body, existing);
+  assertBranchServicesWithinRestaurant(prepared.data);
   ok(res, flattenRestaurant(await restaurantsCrud.update(req.params.id, prepared, null)));
 }));
 
+/**
+ * SEC-M8: a restaurant that still has orders, payments, refunds, products, customers or staff is not deleted. The cascade
+ * from restaurants would remove that data silently. The 409 names each count. Dependants are matched on restaurant_id = id.
+ */
+const RESTAURANT_DEPENDANTS = [
+  { table: 'orders', column: 'restaurant_id', label: 'orders', restaurantColumn: null },
+  { table: 'payouts', column: 'restaurant_id', label: 'payouts', restaurantColumn: null },
+  { table: 'refund_requests', column: 'restaurant_id', label: 'refund requests', restaurantColumn: null },
+  { table: 'products', column: 'restaurant_id', label: 'products', restaurantColumn: null },
+  { table: 'categories', column: 'restaurant_id', label: 'categories', restaurantColumn: null },
+  { table: 'customers', column: 'restaurant_id', label: 'customers', restaurantColumn: null },
+  { table: 'deliverymen', column: 'restaurant_id', label: 'riders', restaurantColumn: null },
+  { table: 'chefs', column: 'restaurant_id', label: 'chefs', restaurantColumn: null },
+  { table: 'subscriptions', column: 'restaurant_id', label: 'subscriptions', restaurantColumn: null },
+  // BUG-021: logins, staff data, rider pay and print history are tenant data too. A restaurant that still has any of them
+  // is refused (409) instead of being deleted and leaving them attached to a reusable restaurant id.
+  { table: 'users', column: 'restaurant_id', label: 'logins', restaurantColumn: null },
+  { table: 'domain_docs', column: 'restaurant_id', label: 'documents', restaurantColumn: null },
+  { table: 'domain_rows', column: 'restaurant_id', label: 'records', restaurantColumn: null },
+  { table: 'driver_pay_policies', column: 'restaurant_id', label: 'rider pay policies', restaurantColumn: null },
+  { table: 'driver_payments', column: 'restaurant_id', label: 'rider payments', restaurantColumn: null },
+  { table: 'driver_cash_settlements', column: 'restaurant_id', label: 'rider cash settlements', restaurantColumn: null },
+  { table: 'print_jobs', column: 'restaurant_id', label: 'print jobs', restaurantColumn: null },
+  { table: 'restaurant_blobs', column: 'restaurant_id', label: 'settings blobs', restaurantColumn: null },
+];
+
 router.delete('/restaurants/:id', asyncHandler(async (req, res) => {
-  ok(res, flattenRestaurant(await restaurantsCrud.remove(req.params.id, null)));
+  const row = await removeWithDependants(pool, {
+    table: 'restaurants',
+    id: req.params.id,
+    restaurantColumn: null,
+    dependants: RESTAURANT_DEPENDANTS,
+  });
+  ok(res, flattenRestaurant(row));
 }));
 
 const STRIPE_SECRET_KEYS = new Set([
@@ -216,41 +368,53 @@ router.get('/stripe', asyncHandler(async (req, res) => {
 
 router.put('/stripe', asyncHandler(async (req, res) => {
   const incoming = req.body || {};
-  const { rows: curRows } = await pool.query('SELECT data FROM stripe_config WHERE id = 1');
-  const prev = (curRows[0] && curRows[0].data) || {};
-  // Deep-merge while restoring any masked secret placeholders from previous config
-  const mergedIncoming = restoreMaskedSecrets(incoming, prev);
-  const data = { ...prev, ...mergedIncoming };
-  if (mergedIncoming.keys && typeof mergedIncoming.keys === 'object') {
-    data.keys = { ...(prev.keys || {}), ...mergedIncoming.keys };
-    ['test', 'live'].forEach((mode) => {
-      if (mergedIncoming.keys[mode] && typeof mergedIncoming.keys[mode] === 'object') {
-        data.keys[mode] = {
-          ...((prev.keys && prev.keys[mode]) || {}),
-          ...mergedIncoming.keys[mode],
-        };
-      }
-    });
+  const client = await pool.connect();
+  let saved;
+  try {
+    await client.query('BEGIN');
+    await client.query("INSERT INTO stripe_config (id, data, updated_at) VALUES (1, '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING");
+    // SEC-M12: the read and the writes happen under one row lock, and each changed key is set with jsonb_set.
+    // A key this request does not send is never rewritten, so a concurrent save of another key is kept.
+    const { rows: curRows } = await client.query('SELECT data FROM stripe_config WHERE id = 1 FOR UPDATE');
+    const prev = (curRows[0] && curRows[0].data) || {};
+    // Deep-merge while restoring any masked secret placeholders from previous config
+    const mergedIncoming = restoreMaskedSecrets(incoming, prev);
+    const data = { ...prev, ...mergedIncoming };
+    if (mergedIncoming.keys && typeof mergedIncoming.keys === 'object') {
+      data.keys = { ...(prev.keys || {}), ...mergedIncoming.keys };
+      ['test', 'live'].forEach((mode) => {
+        if (mergedIncoming.keys[mode] && typeof mergedIncoming.keys[mode] === 'object') {
+          data.keys[mode] = {
+            ...((prev.keys && prev.keys[mode]) || {}),
+            ...mergedIncoming.keys[mode],
+          };
+        }
+      });
+    }
+    if (mergedIncoming.webhook && typeof mergedIncoming.webhook === 'object') {
+      data.webhook = { ...(prev.webhook || {}), ...mergedIncoming.webhook };
+    }
+    for (const key of Object.keys(mergedIncoming)) {
+      await client.query(
+        'UPDATE stripe_config SET data = jsonb_set(data, $1::text[], $2::jsonb, true), updated_at = NOW() WHERE id = 1',
+        [[key], JSON.stringify(data[key] === undefined ? null : data[key])],
+      );
+    }
+    const { rows } = await client.query('SELECT data FROM stripe_config WHERE id = 1');
+    await client.query('COMMIT');
+    saved = rows[0].data;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-  if (mergedIncoming.webhook && typeof mergedIncoming.webhook === 'object') {
-    data.webhook = { ...(prev.webhook || {}), ...mergedIncoming.webhook };
-  }
-  const { rows } = await pool.query(
-    `INSERT INTO stripe_config (id, data, updated_at) VALUES (1, $1, NOW())
-     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
-     RETURNING data`,
-    [JSON.stringify(data)],
-  );
   clearStripeCache();
-  ok(res, maskStripeSecrets(rows[0].data));
+  ok(res, maskStripeSecrets(saved));
 }));
 
 router.get('/platform/revenue', asyncHandler(async (req, res) => {
-  const rawMonths = req.query.months;
-  const parsedMonths = rawMonths !== undefined ? parseInt(rawMonths, 10) : 12;
-  const months = Number.isInteger(parsedMonths)
-    ? Math.min(24, Math.max(1, parsedMonths))
-    : 12;
+  const months = Math.min(24, Math.max(1, +(req.query.months || 12)));
   const { rows: subRows } = await pool.query(
     `SELECT COUNT(*) FILTER (WHERE status = 'active') AS active_subs,
             COUNT(*) AS total_subs FROM subscriptions`,
@@ -265,186 +429,39 @@ router.get('/platform/revenue', asyncHandler(async (req, res) => {
      FROM plans p LEFT JOIN restaurants r ON r.plan_id = p.id
      GROUP BY p.id, p.name ORDER BY count DESC`,
   );
-
-  // Dynamic monthly ledger: calculate subscription revenue, commissions from eligible orders, and setup fees per month
-  const { rows: monthRows } = await pool.query(
+  // Monthly estimated subscription revenue from active plan prices (until invoice ledger exists)
+  const { rows: monthEst } = await pool.query(
     `WITH months AS (
        SELECT generate_series(
          date_trunc('month', NOW()) - (($1::int - 1) || ' months')::interval,
          date_trunc('month', NOW()),
          '1 month'::interval
-       ) AS month_start
+       ) AS month
      ),
-     sub_periods AS (
-       -- Formal subscriptions table records with lifecycle window
-       SELECT 
-         s.restaurant_id,
-         COALESCE(
-           CASE WHEN s.data->>'price' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.data->>'price')::numeric END,
-           CASE WHEN s.data->>'amount' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.data->>'amount')::numeric END,
-           CASE 
-             WHEN s.data->>'billing_cycle' = 'yearly' THEN ROUND((COALESCE(p.price_yearly, 0) / 12)::numeric, 2)
-             ELSE COALESCE(p.price_monthly, 0)
-           END,
-           0
-         ) AS monthly_price,
-         date_trunc('month', COALESCE(s.start_at, s.created_at)) AS start_month,
-         CASE 
-           WHEN s.status = 'canceled' AND s.end_at IS NULL THEN date_trunc('month', s.updated_at)
-           WHEN s.end_at IS NOT NULL THEN date_trunc('month', s.end_at)
-           ELSE NULL
-         END AS end_month
-       FROM subscriptions s
-       JOIN plans p ON p.id = s.plan_id
-       WHERE s.status IN ('active', 'trialing', 'completed', 'canceled')
-         AND (s.payment_status IS NULL OR s.payment_status = 'paid')
-
-       UNION ALL
-
-       -- Fallback for active restaurants that lack discrete subscriptions records
-       SELECT 
-         r.id AS restaurant_id,
-         COALESCE(p.price_monthly, 0) AS monthly_price,
-         date_trunc('month', r.created_at) AS start_month,
-         NULL::timestamptz AS end_month
+     active AS (
+       SELECT COALESCE(SUM(p.price_monthly), 0)::float AS mrr
        FROM restaurants r
        JOIN plans p ON p.id = r.plan_id
-       WHERE r.sub_status IN ('active', 'trialing')
-         AND r.status IS DISTINCT FROM FALSE
-         AND NOT EXISTS (
-           SELECT 1 FROM subscriptions s WHERE s.restaurant_id = r.id
-         )
-     ),
-     setup_fees AS (
-       -- Setup fees recorded in subscriptions
-       SELECT 
-         s.restaurant_id,
-         CASE WHEN s.data->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.data->>'setup_fee')::numeric ELSE 0::numeric END AS setup_fee,
-         date_trunc('month', COALESCE(s.start_at, s.created_at)) AS month_start
-       FROM subscriptions s
-       WHERE (s.data->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$')
-         AND (s.data->>'setup_fee')::numeric > 0
-         AND (s.payment_status IS NULL OR s.payment_status = 'paid')
-
-       UNION ALL
-
-       -- Setup fees recorded in restaurant billing (if not already captured in subscriptions)
-       SELECT 
-         r.id AS restaurant_id,
-         COALESCE(
-           CASE WHEN r.data->'billing'->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (r.data->'billing'->>'setup_fee')::numeric END,
-           CASE WHEN r.data->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (r.data->>'setup_fee')::numeric END,
-           0::numeric
-         ) AS setup_fee,
-         date_trunc('month', COALESCE((r.data->'billing'->>'setup_fee_paid_at')::timestamptz, r.created_at)) AS month_start
-       FROM restaurants r
-       WHERE COALESCE(
-         CASE WHEN r.data->'billing'->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (r.data->'billing'->>'setup_fee')::numeric END,
-         CASE WHEN r.data->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (r.data->>'setup_fee')::numeric END,
-         0::numeric
-       ) > 0
-       AND NOT EXISTS (
-         SELECT 1 FROM subscriptions s 
-         WHERE s.restaurant_id = r.id 
-           AND s.data->>'setup_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$'
-           AND (s.data->>'setup_fee')::numeric > 0
-       )
-     ),
-     active_subs_per_month AS (
-       SELECT 
-         m.month_start,
-         sp.restaurant_id,
-         MAX(sp.monthly_price) AS monthly_price
-       FROM months m
-       JOIN sub_periods sp 
-         ON sp.start_month <= m.month_start 
-        AND (sp.end_month IS NULL OR sp.end_month >= m.month_start)
-       GROUP BY m.month_start, sp.restaurant_id
-     ),
-     monthly_subs AS (
-       SELECT 
-         m.month_start,
-         COALESCE(SUM(asp.monthly_price), 0)::float AS subscription
-       FROM months m
-       LEFT JOIN active_subs_per_month asp ON asp.month_start = m.month_start
-       GROUP BY m.month_start
-     ),
-     active_setups_per_month AS (
-       SELECT 
-         sf.month_start,
-         sf.restaurant_id,
-         MAX(sf.setup_fee) AS setup_fee
-       FROM setup_fees sf
-       GROUP BY sf.month_start, sf.restaurant_id
-     ),
-     monthly_setups AS (
-       SELECT 
-         m.month_start,
-         COALESCE(SUM(asf.setup_fee), 0)::float AS setup_fee
-       FROM months m
-       LEFT JOIN active_setups_per_month asf ON asf.month_start = m.month_start
-       GROUP BY m.month_start
-     ),
-     monthly_commissions AS (
-       SELECT 
-         m.month_start,
-         COALESCE(SUM(
-           CASE 
-             WHEN o.data->>'commission' ~ '^-?[0-9]+(\\.[0-9]+)?$' 
-               THEN (o.data->>'commission')::numeric
-             WHEN o.data->>'application_fee' ~ '^-?[0-9]+(\\.[0-9]+)?$' 
-               THEN (o.data->>'application_fee')::numeric
-             WHEN r.data->'billing'->>'commission_type' = 'fixed' 
-              AND r.data->'billing'->>'commission_value' ~ '^-?[0-9]+(\\.[0-9]+)?$' 
-               THEN (r.data->'billing'->>'commission_value')::numeric
-             WHEN r.data->'billing'->>'commission_value' ~ '^-?[0-9]+(\\.[0-9]+)?$' 
-               THEN ROUND((COALESCE(o.total, 0) * (r.data->'billing'->>'commission_value')::numeric / 100)::numeric, 2)
-             WHEN p.data->>'commission' ~ '^-?[0-9]+(\\.[0-9]+)?$' 
-               THEN ROUND((COALESCE(o.total, 0) * (p.data->>'commission')::numeric / 100)::numeric, 2)
-             ELSE 0::numeric
-           END
-         ), 0)::float AS commission
-       FROM months m
-       LEFT JOIN orders o 
-         ON date_trunc('month', o.created_at) = m.month_start
-        AND (o.payment_status = 'paid' OR o.status IN ('delivered', 'completed'))
-        AND o.status NOT IN ('cancelled', 'refunded')
-        AND (o.payment_status IS DISTINCT FROM 'refunded')
-       LEFT JOIN restaurants r ON r.id = o.restaurant_id
-       LEFT JOIN plans p ON p.id = r.plan_id
-       GROUP BY m.month_start
+       WHERE r.sub_status IN ('active', 'trialing') AND r.status IS DISTINCT FROM FALSE
      )
-     SELECT 
-       to_char(m.month_start, 'YYYY-MM') AS month,
-       ROUND(COALESCE(ms.subscription, 0)::numeric, 2)::float AS subscription,
-       ROUND(COALESCE(mc.commission, 0)::numeric, 2)::float AS commission,
-       ROUND(COALESCE(mst.setup_fee, 0)::numeric, 2)::float AS setup_fee,
-       ROUND((COALESCE(ms.subscription, 0) + COALESCE(mc.commission, 0) + COALESCE(mst.setup_fee, 0))::numeric, 2)::float AS total
+     SELECT to_char(m.month, 'YYYY-MM') AS month,
+            (SELECT mrr FROM active) AS subscription,
+            0::float AS commission,
+            0::float AS setup_fee,
+            (SELECT mrr FROM active) AS total
      FROM months m
-     LEFT JOIN monthly_subs ms ON ms.month_start = m.month_start
-     LEFT JOIN monthly_commissions mc ON mc.month_start = m.month_start
-     LEFT JOIN monthly_setups mst ON mst.month_start = m.month_start
-     ORDER BY m.month_start ASC`,
+     ORDER BY m.month`,
     [months],
   );
-
-  const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-  const paidTotal = monthRows.reduce((s, r) => round2(s + Number(r.subscription || 0)), 0);
-  const totalRevenue = monthRows.reduce((s, r) => round2(s + Number(r.total || 0)), 0);
-  const totalCommission = monthRows.reduce((s, r) => round2(s + Number(r.commission || 0)), 0);
-  const totalSetupFee = monthRows.reduce((s, r) => round2(s + Number(r.setup_fee || 0)), 0);
-
+  const paidTotal = monthEst.reduce((s, r) => s + Number(r.subscription || 0), 0);
   ok(res, {
     subscriptions: subRows[0],
     restaurants: restRows[0],
     plans_breakdown: planRows,
-    months: monthRows,
-    series: monthRows,
+    months: monthEst,
+    series: monthEst,
     subscription_earnings_estimate: paidTotal,
-    total_revenue: totalRevenue,
-    commission_total: totalCommission,
-    setup_fee_total: totalSetupFee,
-    source: 'dynamic_monthly_ledger',
+    source: 'plan_mrr_estimate',
   });
 }));
 
@@ -492,9 +509,13 @@ function assertTicketAccess(req, row) {
   if (!row) throw notFound();
   if (req.user?.role === 'super') return row;
   const rid = restaurantId(req);
-  if (row.restaurant_id !== rid && !(row.data && row.data.restaurant_id === rid)) {
+  // Only the restaurant_id column decides ownership. A restaurant_id inside `data` is client input (SEC-H7).
+  if (row.restaurant_id !== rid) {
     throw forbidden('Ticket belongs to another restaurant');
   }
+  // A branch login sees only its own branch's tickets. The owner sees every ticket of the restaurant (consolidated).
+  const bound = branchId(req);
+  if (bound && String(row.branch_id || '') !== String(bound)) throw notFound();
   return row;
 }
 
@@ -502,21 +523,18 @@ function assertTicketAccess(req, row) {
 (function mountSupportTickets() {
   const crud = buildCrud(pool, 'support_tickets', { restaurantColumn: null, jsonColumns: ['messages', 'data'] });
   router.get('/support-tickets', asyncHandler(async (req, res) => {
-    let sql = 'SELECT * FROM support_tickets';
-    const params = [];
+    let rows = await crud.list(null);
     if (req.user?.role !== 'super') {
       const rid = restaurantId(req);
-      params.push(rid);
-      sql += ` WHERE (restaurant_id = $1 OR (data->>'restaurant_id') = $1)`;
+      rows = rows.filter((t) => t.restaurant_id === rid);
+      const bound = branchId(req);
+      if (bound) rows = rows.filter((t) => String(t.branch_id || '') === String(bound));
     } else {
       const filter = tenantRestaurantId(req);
       if (filter) {
-        params.push(filter);
-        sql += ` WHERE (restaurant_id = $1 OR (data->>'restaurant_id') = $1)`;
+        rows = rows.filter((t) => t.restaurant_id === filter);
       }
     }
-    sql += ' ORDER BY created_at DESC, id ASC';
-    const { rows } = await pool.query(sql, params);
     ok(res, rows);
   }));
   router.get('/support-tickets/:id', asyncHandler(async (req, res) => {
@@ -531,6 +549,8 @@ function assertTicketAccess(req, row) {
     if (b.tillName) data.tillName = b.tillName;
     if (b.unread_admin != null) data.unread_admin = b.unread_admin;
     if (b.unread_epos != null) data.unread_epos = b.unread_epos;
+    // Tenant scope is the restaurant_id column only, never a value the client put inside data (SEC-H7).
+    delete data.restaurant_id;
     const isSuper = req?.user?.role === 'super';
     // Tenants cannot self-assign, resolve, or close tickets as platform staff
     if (isSuper && b.resolved_at) data.resolved_at = b.resolved_at;
@@ -567,6 +587,8 @@ function assertTicketAccess(req, row) {
     if (!body.id) body.id = `TK-${Date.now().toString(36)}`;
     if (!body.restaurant_id) body.restaurant_id = forceRid;
     if (req.user?.role !== 'super') body.status = body.status || 'open';
+    // A branch login's tickets belong to its branch, whatever the body says. The owner's tickets have no branch.
+    if (req.user?.role !== 'super') body.branch_id = branchId(req) || null;
     created(res, await crud.create(body, null));
   }));
   router.put('/support-tickets/:id', asyncHandler(async (req, res) => {
@@ -596,66 +618,6 @@ function assertTicketAccess(req, row) {
     if (req.user?.role !== 'super') throw forbidden('Only platform admins can delete tickets');
     ok(res, await crud.remove(req.params.id, null));
   }));
-
-  const handleSupportContact = asyncHandler(async (req, res) => {
-    const { email, country_code, phone, message } = req.body || {};
-    if (!message) throw badRequest('message is required');
-    const id = `tkt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    const fullPhone = `${country_code || ''}${phone || ''}`.trim();
-    const requester = email || fullPhone || req.user?.email || 'Kitchen Staff';
-    let rid = null;
-    try { rid = restaurantId(req); } catch { rid = req.body?.restaurant_id || null; }
-
-    const ticket = {
-      id,
-      restaurant_id: rid,
-      subject: 'Kitchen Support Inquiry',
-      body: String(message),
-      channel: 'kitchen_app',
-      requester,
-      status: 'open',
-      priority: 'normal',
-      messages: [{
-        from: requester,
-        at: new Date().toISOString(),
-        body: String(message),
-      }],
-      data: {
-        email: email || null,
-        phone: fullPhone || null,
-        country_code: country_code || null,
-        submitted_by_role: req.user?.role || 'public',
-      },
-    };
-
-    await pool.query(
-      `INSERT INTO support_tickets (id, restaurant_id, subject, body, channel, requester, status, priority, messages, data, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, NOW(), NOW())`,
-      [
-        ticket.id,
-        ticket.restaurant_id,
-        ticket.subject,
-        ticket.body,
-        ticket.channel,
-        ticket.requester,
-        ticket.status,
-        ticket.priority,
-        JSON.stringify(ticket.messages),
-        JSON.stringify(ticket.data),
-      ]
-    );
-
-    created(res, {
-      success: true,
-      ticket_id: id,
-      message: 'Support inquiry submitted successfully',
-      ticket,
-    });
-  });
-
-  router.post('/support/contact', handleSupportContact);
-  router.post('/support-tickets/contact', handleSupportContact);
-  router.handleSupportContact = handleSupportContact;
 })();
 
 // ---- Payouts (super only via platformGate) ----
@@ -687,19 +649,14 @@ function assertTicketAccess(req, row) {
     };
   }
   router.get('/payouts', asyncHandler(async (req, res) => {
-    let sql = 'SELECT * FROM payouts';
-    const params = [];
+    let rows = (await crud.list(null)).map(unpackPayout);
     if (req.user?.role !== 'super') {
       const rid = restaurantId(req);
-      params.push(rid);
-      sql += ' WHERE restaurant_id = $1';
+      rows = rows.filter((p) => p.restaurant_id === rid);
     } else if (req.query.restaurant_id) {
-      params.push(req.query.restaurant_id);
-      sql += ' WHERE restaurant_id = $1';
+      rows = rows.filter((p) => p.restaurant_id === req.query.restaurant_id);
     }
-    sql += ' ORDER BY created_at DESC, id ASC';
-    const { rows } = await pool.query(sql, params);
-    ok(res, rows.map(unpackPayout));
+    ok(res, rows);
   }));
   router.get('/payouts/:id', asyncHandler(async (req, res) => {
     const row = unpackPayout(await crud.getById(req.params.id, null));
@@ -709,13 +666,16 @@ function assertTicketAccess(req, row) {
     }
     ok(res, row);
   }));
-  router.post('/payouts', asyncHandler(async (req, res) => {
+  router.post('/payouts', idempotent('payouts'), asyncHandler(async (req, res) => {
     let body = packPayout(req.body);
     if (!body.id) body.id = `po_${Date.now().toString(36)}`;
     if (req.user?.role !== 'super') {
       body.restaurant_id = restaurantId(req);
       body.status = 'requested';
-      body.data = { ...(body.data || {}), kind: body.data?.kind || 'request' };
+      // A tenant request cannot choose its kind, Stripe destination, totals or order list. Those come from the server (SEC-C5).
+      const { kind, stripe_account, totals, order_ids, period, ...safeData } = body.data || {};
+      body.data = { ...safeData, kind: 'request' };
+      if (!Number.isFinite(Number(body.amount)) || Number(body.amount) <= 0) throw badRequest('amount must be a positive number');
     }
     if (!body.restaurant_id) throw badRequest('restaurant_id required');
     created(res, unpackPayout(await crud.create(body, null)));
@@ -744,18 +704,13 @@ function assertTicketAccess(req, row) {
     return row;
   }
   router.get('/refund-requests', asyncHandler(async (req, res) => {
-    let sql = 'SELECT * FROM refund_requests';
-    const params = [];
+    let rows = await crud.list(null);
     if (req.user?.role !== 'super') {
       const rid = restaurantId(req);
-      params.push(rid);
-      sql += ' WHERE restaurant_id = $1';
+      rows = rows.filter((r) => r.restaurant_id === rid);
     } else if (req.query.restaurant_id) {
-      params.push(req.query.restaurant_id);
-      sql += ' WHERE restaurant_id = $1';
+      rows = rows.filter((r) => r.restaurant_id === req.query.restaurant_id);
     }
-    sql += ' ORDER BY created_at DESC, id ASC';
-    const { rows } = await pool.query(sql, params);
     ok(res, rows);
   }));
   router.get('/refund-requests/:id', asyncHandler(async (req, res) => {
@@ -770,27 +725,107 @@ function assertTicketAccess(req, row) {
       out.status = 'pending';
     } else if (out.status !== undefined && out.status !== existing.status) {
       const next = String(out.status).toLowerCase();
-      if (!(String(existing.status).toLowerCase() === 'pending' && next === 'canceled')) {
+      const tillCashApproval = req.managerApproved === true && next === 'approved';
+      if (!tillCashApproval && !(String(existing.status).toLowerCase() === 'pending' && next === 'canceled')) {
         throw forbidden('Only platform admins can change refund request status');
       }
     }
     return out;
   }
-  router.post('/refund-requests', asyncHandler(async (req, res) => {
+  router.post('/refund-requests', idempotent('refund-requests'), asyncHandler(async (req, res) => {
     let body = { ...(req.body || {}) };
     if (!body.id) body.id = `rf_${Date.now().toString(36)}`;
     body = sanitizeRefundWrite(req, body, null);
     if (!body.restaurant_id) throw badRequest('restaurant_id required');
     created(res, await crud.create(body, null));
   }));
+  /**
+   * A cash refund at the till is approved only with the PIN of a restaurant manager (can_approve) (cash refund decision).
+   * The PIN is read from the body and removed from it, so it is never stored. Any other request gets false.
+   */
+  async function verifyCashRefundManager(req, existing) {
+    const pin = req.body && req.body.manager_pin;
+    if (req.body) delete req.body.manager_pin;
+    if (req.user?.role !== 'epos' || String(req.body?.status || '').toLowerCase() !== 'approved') return false;
+    const method = String(existing.method || (existing.data && existing.data.method) || '').toLowerCase();
+    if (method !== 'cash') return false;
+    if (!/^\d{4,8}$/.test(String(pin || ''))) throw forbidden('A manager PIN is required to approve a cash refund');
+    const { rows } = await pool.query(
+      "SELECT pin_hash FROM till_staff WHERE restaurant_id = $1 AND COALESCE(status, TRUE) = TRUE AND COALESCE((data->>'can_approve')::boolean, FALSE) = TRUE AND pin_hash IS NOT NULL",
+      [existing.restaurant_id],
+    );
+    for (const row of rows) {
+      if (await bcrypt.compare(String(pin), row.pin_hash)) return true;
+    }
+    throw forbidden('The manager PIN is not valid for this restaurant');
+  }
+
+  /**
+   * A manual (non-Stripe) refund approved by a platform admin is recorded on its order, under the same cap as
+   * Stripe refunds (FE-H1 / ORD-H7). Stripe refunds record themselves in the Stripe route, so they are skipped here.
+   */
+  async function recordManualRefundApproval(existing, body) {
+    const approving = String(body.status || '').toLowerCase() === 'approved'
+      && String(existing.status || '').toLowerCase() !== 'approved';
+    if (!approving || !existing.order_id) return;
+    const rd = existing.data && typeof existing.data === 'object' ? existing.data : {};
+    if (rd.stripe_refund_id) return;
+    const amount = Math.round(Number(existing.amount || 0) * 100) / 100;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // BUG-023: the refund request's own restaurant must own the order. A bare id lookup could move another tenant's refund cap.
+      const { rows } = await client.query(
+        'SELECT total, data, created_at FROM orders WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+        [existing.order_id, existing.restaurant_id],
+      );
+      if (!rows[0]) throw notFound('Order not found for this refund');
+      const already = Number((rows[0].data && rows[0].data.refund_amount) || 0);
+      const remaining = Math.round((Number(rows[0].total) - already) * 100) / 100;
+      if (!(amount > 0) || amount > remaining + 0.005) {
+        const err = new Error(`Only ${Math.max(0, remaining).toFixed(2)} can still be refunded on this order`);
+        err.status = 409;
+        throw err;
+      }
+      await client.query(
+        `UPDATE orders SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('refund_amount', $2::numeric), updated_at = NOW()
+         WHERE id = $1`,
+        [existing.order_id, Math.round((already + amount) * 100) / 100],
+      );
+      await client.query('COMMIT');
+      // BUG-017: the refunded share of the sale is reversed in the ledger. A posting failure is flagged on the order for reconciliation.
+      const total = Number(rows[0].total);
+      const fullyRefunded = Math.round((already + amount) * 100) / 100 + 0.009 >= total;
+      try {
+        await accounting.postRefundSale(existing.restaurant_id, {
+          id: existing.order_id, total, created_at: rows[0].created_at, restaurant_id: existing.restaurant_id,
+        }, { refundAmount: amount, refundKey: `request-${existing.id}`, fullyRefunded });
+      } catch (postErr) {
+        await pool.query(
+          `UPDATE orders SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+          [existing.order_id, JSON.stringify({ refund_journal_pending: { refund_request_id: existing.id, error: String(postErr.message || '').slice(0, 200) } })],
+        ).catch(() => {});
+        console.error('[refunds] ledger posting pending for order', existing.order_id, postErr.message);
+      }
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
   router.put('/refund-requests/:id', asyncHandler(async (req, res) => {
     const existing = assertRefund(req, await crud.getById(req.params.id, null));
+    req.managerApproved = await verifyCashRefundManager(req, existing);
     const body = sanitizeRefundWrite(req, req.body || {}, existing);
+    await recordManualRefundApproval(existing, body);
     ok(res, await crud.update(req.params.id, body, null));
   }));
   router.patch('/refund-requests/:id', asyncHandler(async (req, res) => {
     const existing = assertRefund(req, await crud.getById(req.params.id, null));
+    req.managerApproved = await verifyCashRefundManager(req, existing);
     const body = sanitizeRefundWrite(req, req.body || {}, existing);
+    await recordManualRefundApproval(existing, body);
     ok(res, await crud.update(req.params.id, body, null));
   }));
   router.delete('/refund-requests/:id', asyncHandler(async (req, res) => {
@@ -800,100 +835,69 @@ function assertTicketAccess(req, row) {
   }));
 })();
 
+// ---- Refund postings waiting for reconciliation (platform admins only) ----
+// Orders whose refund reached Stripe but whose vendor-side adjustment or ledger posting did not finish.
+router.get('/refund-reconciliation', asyncHandler(async (req, res) => {
+  if (req.user?.role !== 'super') throw forbidden('Only platform admins can see refund reconciliation');
+  const { rows } = await pool.query(
+    `SELECT id, restaurant_id, branch_id, total, refund_amount, payment_status, data, updated_at
+       FROM orders
+      WHERE data ? 'vendor_adjustment_pending' OR data ? 'refund_journal_pending'
+      ORDER BY updated_at DESC
+      LIMIT 500`,
+  );
+  ok(res, rows.map((r) => ({
+    order_id: r.id,
+    restaurant_id: r.restaurant_id,
+    branch_id: r.branch_id,
+    total: r.total,
+    refund_amount: r.refund_amount,
+    payment_status: r.payment_status,
+    vendor_adjustment_pending: r.data?.vendor_adjustment_pending || null,
+    refund_journal_pending: r.data?.refund_journal_pending || null,
+    updated_at: r.updated_at,
+  })));
+}));
+
 // ---- Audit events ----
 router.get('/audit-events', asyncHandler(async (req, res) => {
-  const parsedLimit = parseInt(req.query.limit, 10);
-  const limit = Number.isInteger(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 500)) : 200;
-
-  const where = [];
-  const params = [];
-
-  if (req.query.restaurant_id && typeof req.query.restaurant_id === 'string' && req.query.restaurant_id.trim()) {
-    params.push(req.query.restaurant_id.trim());
-    where.push(`restaurant_id = $${params.length}`);
-  }
-  if (req.query.actor && typeof req.query.actor === 'string' && req.query.actor.trim()) {
-    params.push(req.query.actor.trim());
-    where.push(`actor = $${params.length}`);
-  }
-  if (req.query.action && typeof req.query.action === 'string' && req.query.action.trim()) {
-    params.push(req.query.action.trim());
-    where.push(`action = $${params.length}`);
-  }
-  if (req.query.entity_type && typeof req.query.entity_type === 'string' && req.query.entity_type.trim()) {
-    params.push(req.query.entity_type.trim());
-    where.push(`entity_type = $${params.length}`);
-  }
-  if (req.query.entity_id && typeof req.query.entity_id === 'string' && req.query.entity_id.trim()) {
-    params.push(req.query.entity_id.trim());
-    where.push(`entity_id = $${params.length}`);
-  }
-
-  params.push(limit);
-  const sql = `SELECT * FROM audit_events${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT $${params.length}`;
-  const { rows } = await pool.query(sql, params);
+  const limit = Math.min(+(req.query.limit || 200), 500);
+  const { rows } = await pool.query(
+    'SELECT * FROM audit_events ORDER BY created_at DESC LIMIT $1',
+    [limit],
+  );
   ok(res, rows);
 }));
 
 router.post('/audit-events', asyncHandler(async (req, res) => {
   const b = req.body || {};
-
-  // 1. Mandatory non-empty action validation
-  if (!b.action || typeof b.action !== 'string' || !b.action.trim()) {
-    throw badRequest('Valid audit action is required');
-  }
-  const action = b.action.trim();
-  if (action.length > 100) {
-    throw badRequest('Audit action must not exceed 100 characters');
-  }
-
-  // 2. Server-generated collision-resistant ID (reject client-controlled primary key)
-  const id = `ae_${crypto.randomUUID()}`;
-
-  // 3. Derive actor strictly from authenticated session
-  const actor = req.user?.email || req.user?.id || req.user?.sub || 'system';
-
-  // 4. Safely handle structured data payload
-  let data = {};
-  if (b.data && typeof b.data === 'object' && !Array.isArray(b.data)) {
-    data = { ...b.data };
-  } else if (typeof b.data === 'string') {
-    try {
-      const parsed = JSON.parse(b.data);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        data = parsed;
-      }
-    } catch {
-      throw badRequest('Invalid JSON in data payload');
-    }
-  }
-
-  // Preserve requested_actor if caller submitted a differing actor for forensic logging without forging actor column
-  if (b.actor && typeof b.actor === 'string' && b.actor !== actor) {
-    data.requested_actor = b.actor;
-  }
-
-  // 5. Sanitize entity and restaurant references
-  const entityType = b.entity_type && typeof b.entity_type === 'string' ? b.entity_type.trim() : null;
-  const entityId = b.entity_id && typeof b.entity_id === 'string' ? b.entity_id.trim() : null;
-  const restaurantId = b.restaurant_id && typeof b.restaurant_id === 'string' ? b.restaurant_id.trim() : null;
-  const detail = b.detail && typeof b.detail === 'string' ? b.detail.trim() : null;
-
+  const id = b.id || `ae_${Date.now().toString(36)}`;
   const { rows } = await pool.query(
     `INSERT INTO audit_events (id, actor, action, entity_type, entity_id, restaurant_id, detail, data)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [
       id,
-      actor,
-      action,
-      entityType,
-      entityId,
-      restaurantId,
-      detail,
-      JSON.stringify(data),
+      b.actor || req.user?.email || 'system',
+      b.action || 'event',
+      b.entity_type || null,
+      b.entity_id || null,
+      b.restaurant_id || null,
+      b.detail || null,
+      JSON.stringify(b.data || {}),
     ],
   );
   created(res, rows[0]);
 }));
+
+// Map Postgres errors caused by bad client input to 400 (everything else falls through to the app handler).
+// SEC-M16: the Postgres message is logged, not returned. The client gets a fixed message.
+const INPUT_ERROR_CODES = new Set(['22P02', '22007', '22008', '22003', '22001', '23502', '23514']);
+router.use((err, req, res, next) => {
+  if (err && INPUT_ERROR_CODES.has(err.code)) {
+    console.error('[platform] invalid input', err.code, err.column || '', err.message);
+    return next(badRequest('Invalid input: a field has the wrong type, format or length'));
+  }
+  return next(err);
+});
 
 module.exports = router;

@@ -3,58 +3,39 @@ require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 const { createApp } = require('@cravedash/shared/src/createApp');
 const { listenHost } = require('@cravedash/shared/src/listenHost');
-const { requireAuth, requireRole, optionalAuth, restaurantId } = require('@cravedash/shared/src/authMiddleware');
+const { requireAuth, requireRole } = require('@cravedash/shared/src/authMiddleware');
 const { forbidden } = require('@cravedash/shared/src/errors');
+const { requireEposStaffSession } = require('@cravedash/shared/src/eposStaffWrite');
 const catalog = require('./routes/catalog');
+const publicCatalog = require('./routes/publicCatalog');
 
 const app = createApp('catalog-service');
 const PORT = +(process.env.PORT || 4002);
 const HOST = listenHost();
 
+// EPOS spec: a till may create, change and delete a product or category, with a staff PIN session. Bulk import stays with the admin.
+const EPOS_STAFF_WRITE_PATHS = ['/products', '/categories'];
+
 function eposReadOnly(req, res, next) {
-  // EPOS terminals with staff approval or manager sessions are allowed to modify catalogue
+  if (req.user?.role === 'epos' && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    const path = req.path || '';
+    const open = path !== '/products/bulk' && EPOS_STAFF_WRITE_PATHS.some((p) => path === p || path.startsWith(`${p}/`));
+    if (!open) return next(forbidden('EPOS role cannot modify catalogue'));
+    try {
+      requireEposStaffSession(req);
+    } catch (err) {
+      return next(err);
+    }
+  }
   next();
 }
 
-/** Public catalog reads (GET) supported via X-API-KEY / JWT; mutations require staff role */
-function catalogAuth(req, res, next) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    return optionalAuth(req, res, () => {
-      try {
-        restaurantId(req);
-        next();
-      } catch (err) {
-        next(err);
-      }
-    });
-  }
-  requireAuth(req, res, (err) => {
-    if (err) return next(err);
-    requireRole('super', 'restaurant', 'epos')(req, res, (roleErr) => {
-      if (roleErr) return next(roleErr);
-      eposReadOnly(req, res, next);
-    });
-  });
-}
+// Public read-only catalogue for the website. Mounted before the login check; it has GET routes only.
+app.use('/api/v1/public', publicCatalog);
 
-app.use('/api/v1', catalogAuth, catalog);
+app.use('/api/v1', requireAuth, requireRole('super', 'restaurant', 'epos'), eposReadOnly, catalog);
 
-// Error handler must be after routes (createApp registers one too early for late mounts)
-const { fail } = require('@cravedash/shared/src/response');
-const { AppError } = require('@cravedash/shared/src/errors');
-app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  if (!(err instanceof AppError)) {
-    console.error('[catalog-service]', err);
-    err = new AppError(err.message || 'Internal error', 500, 'INTERNAL_ERROR');
-  }
-  fail(res, err);
+app.listen(PORT, HOST, () => {
+  console.log(`Catalog service on http://${HOST}:${PORT}`);
+  require('@cravedash/shared/src/db').warmPool();
 });
-
-if (require.main === module) {
-  app.listen(PORT, HOST, () => {
-    console.log(`Catalog service on http://${HOST}:${PORT}`);
-  });
-}
-
-module.exports = app;

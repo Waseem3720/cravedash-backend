@@ -5,8 +5,8 @@
 const express = require('express');
 const { ok, created } = require('@cravedash/shared/src/response');
 const asyncHandler = require('@cravedash/shared/src/asyncHandler');
-const { restaurantId } = require('@cravedash/shared/src/authMiddleware');
-const { badRequest, forbidden } = require('@cravedash/shared/src/errors');
+const { restaurantId, branchId } = require('@cravedash/shared/src/authMiddleware');
+const { AppError, badRequest, forbidden, notFound } = require('@cravedash/shared/src/errors');
 const pool = require('@cravedash/shared/src/db');
 const {
   inventory, wallet, accounting, payroll, couriers, tips,
@@ -76,11 +76,11 @@ router.post('/engines/inventory/deduct-order', asyncHandler(async (req, res) => 
 
 // ─── Wallet / loyalty ────────────────────────────────────────
 router.get('/engines/wallet/report', asyncHandler(async (req, res) => {
-  ok(res, await wallet.walletReport(rid(req)));
+  ok(res, await wallet.walletReport(rid(req), branchId(req)));
 }));
 
 router.get('/engines/loyalty/report', asyncHandler(async (req, res) => {
-  ok(res, await wallet.loyaltyReport(rid(req)));
+  ok(res, await wallet.loyaltyReport(rid(req), branchId(req)));
 }));
 
 router.post('/engines/wallet/credit', asyncHandler(async (req, res) => {
@@ -115,10 +115,34 @@ router.get('/engines/accounting/reports', asyncHandler(async (req, res) => {
   ok(res, await accounting.reports(rid(req)));
 }));
 
+/** Sources the manual journal screens send (the Journals and Manual Journal tabs). Anything else is refused. */
+const MANUAL_JOURNAL_SOURCES = new Set(['manual', 'journals']);
+
+/** The manual journal source: missing or empty means 'manual'. Case and surrounding spaces are ignored. */
+function manualJournalSource(value) {
+  const text = value == null ? '' : String(value).trim().toLowerCase();
+  const source = text === '' ? 'manual' : text;
+  if (!MANUAL_JOURNAL_SOURCES.has(source)) {
+    throw badRequest(`Unknown journal source "${source}". Manual journals use "manual" or "journals".`);
+  }
+  return source;
+}
+
 router.post('/engines/accounting/journals', asyncHandler(async (req, res) => {
   assertNotEposSensitive(req);
+  // A manual journal carries only its own fields. Tax snapshots are never taken from the client. Protected sources
+  // (sale, sale_reversal) are refused by the source allowlist here, and again by postJournal.
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const source = manualJournalSource(body.source);
   try {
-    created(res, await accounting.postJournal(rid(req), { ...req.body, by: actor(req) }));
+    created(res, await accounting.postJournal(rid(req), {
+      date: body.date,
+      description: body.description,
+      lines: body.lines,
+      ref: body.ref,
+      source,
+      by: actor(req),
+    }));
   } catch (e) { mapEngineError(e); }
 }));
 
@@ -152,7 +176,7 @@ router.post('/engines/payroll/runs/close', asyncHandler(async (req, res) => {
 // ─── Couriers / marketplaces ─────────────────────────────────
 router.post('/engines/couriers/dispatch', asyncHandler(async (req, res) => {
   try {
-    created(res, await couriers.dispatch(pool, rid(req), { ...req.body, by: actor(req) }));
+    created(res, await couriers.dispatch(pool, rid(req), { ...req.body, by: actor(req) }, branchId(req) || null));
   } catch (e) { mapEngineError(e); }
 }));
 
@@ -163,6 +187,8 @@ router.post('/engines/marketplaces/ingest', asyncHandler(async (req, res) => {
 
 router.post('/engines/marketplaces/:source/webhook', asyncHandler(async (req, res) => {
   // Public-ish: validated by integration secret header when present
+  // Unverified duplicate of the signed route in marketplaceWebhook.js (SEC-C2). Refused outright.
+  throw forbidden('Use the signed marketplace webhook route');
   const source = req.params.source;
   const restaurantHint = req.body?.restaurant_id || req.headers['x-restaurant-id'] || req.query.restaurant_id || rid(req);
   if (!restaurantHint) throw badRequest('restaurant_id required');
@@ -189,6 +215,23 @@ router.post('/engines/terminals/charge', asyncHandler(async (req, res) => {
   const { amount, currency, reader_id, order_id, description, channel } = req.body || {};
   const pence = Math.round((+amount || 0) * 100);
   if (pence < 1) throw badRequest('amount required');
+  // Every terminal charge must be tied to an order, so it can never take an amount with no sale behind it (SEC-H2).
+  if (!order_id) throw badRequest('order_id is required for a terminal charge');
+  // The charge must belong to an order of this restaurant, and its amount must match that order (audit 04 S-02, roadmap 1.2).
+  // The allowed range is the order total up to the total plus the tip recorded on the order.
+  if (order_id) {
+    const { rows: ord } = await pool.query(
+      'SELECT id, total, tip, payment_status FROM orders WHERE id = $1 AND restaurant_id = $2',
+      [order_id, rid(req)],
+    );
+    if (!ord[0]) throw notFound('Order not found for this restaurant');
+    if (String(ord[0].payment_status || '').toLowerCase() === 'paid') throw badRequest('Order is already paid');
+    const total = Math.round(Number(ord[0].total) * 100);
+    const tip = Math.max(0, Math.round(Number(ord[0].tip || 0) * 100));
+    if (pence < total || pence > total + tip) {
+      throw badRequest('Charge amount does not match the order total');
+    }
+  }
   try {
     const connect = require('@cravedash/shared/src/stripeConnect');
     const { stripe, config } = await getStripe();
@@ -263,7 +306,11 @@ router.post('/engines/terminals/charge', asyncHandler(async (req, res) => {
           }),
           restaurantId,
         ],
-      ).catch(() => {});
+      ).catch((err) => {
+        // SEC-M15: a charge that is not linked to its order is refused before the reader takes the card (no fake success).
+        console.error(`[terminal] order link failed: intent=${intent.id} order=${order_id} error=${err.message}`);
+        throw new AppError('Card payment could not be linked to the order; the card was not charged', 503, 'LINK_FAILED');
+      });
     }
     connect.logStripe('terminal.payment_intent.created', {
       intent_id: intent.id,

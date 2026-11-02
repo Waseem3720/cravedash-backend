@@ -1,5 +1,7 @@
 const { verify } = require('./jwt');
 const { unauthorized, forbidden, badRequest } = require('./errors');
+const { isAccountActive } = require('./accountStatus');
+const { applyBranchContext } = require('./branchContext');
 
 /** MFA pending tickets and EPOS staff JWTs must not authenticate as a full session. */
 function assertFullSession(claims) {
@@ -18,7 +20,7 @@ function assertFullSession(claims) {
 
 function optionalAuth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query?.token || null);
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return next();
   try {
     req.user = assertFullSession(verify(token));
@@ -31,21 +33,34 @@ function optionalAuth(req, res, next) {
 
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query?.token || null);
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return next(unauthorized('Missing token'));
   try {
     req.user = assertFullSession(verify(token));
-    return next();
   } catch (e) {
     if (e && e.status === 401) return next(e);
     return next(unauthorized('Invalid or expired token'));
   }
+  // Customer tokens (from the OAuth customer login) are not staff sessions. No customer-facing route exists yet,
+  // so the staff APIs refuse them (SEC-C3). Add a customer-only guard when those routes are built.
+  if (req.user.role === 'customer') return next(forbidden('Customer accounts cannot use staff APIs'));
+  // A signed token is not enough: the account must still exist, be active and keep the same role (SEC-H4).
+  isAccountActive(req.user).then(async (active) => {
+    if (!active) return next(unauthorized('Account is disabled or its role changed. Please sign in again.'));
+    try {
+      await applyBranchContext(req);
+    } catch (err) {
+      return next(err);
+    }
+    return next();
+  });
+  return undefined;
 }
 
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return next(unauthorized());
-    if (!roles.includes(req.user.role)) return next(forbidden('Invalid role'));
+    if (!roles.includes(req.user.role)) return next(unauthorized('Invalid role'));
     next();
   };
 }
@@ -58,16 +73,14 @@ function requireRole(...roles) {
 function restaurantId(req) {
   if (req.user?.role === 'super') {
     const fromQuery = req.query.restaurant_id || req.headers['x-restaurant-id'];
-    return fromQuery || req.user.restaurant_id || null;
+    const id = fromQuery || req.user.restaurant_id;
+    if (!id) throw badRequest('restaurant_id required (send x-restaurant-id)');
+    return id;
   }
-  if (req.user?.restaurant_id) {
-    return req.user.restaurant_id;
+  if (!req.user?.restaurant_id) {
+    throw badRequest('restaurant_id missing from session');
   }
-  // Public storefront / edge requests validated via X-API-KEY set x-restaurant-id downstream
-  if (req.headers && req.headers['x-restaurant-id']) {
-    return req.headers['x-restaurant-id'];
-  }
-  throw badRequest('restaurant_id missing from session');
+  return req.user.restaurant_id;
 }
 
 /** Safe wrapper that returns null instead of throwing (for optional list scopes). */
@@ -125,6 +138,27 @@ function assertBranchAccess(req, candidateBranchId, opts = {}) {
   }
 }
 
+/**
+ * Row scope for branch-owned tenant data (a row's branch_id: NULL means restaurant-level).
+ * - branch login: its own branch's rows only.
+ * - restaurant owner, or an EPOS session with no branch: restaurant-level rows only (never another branch's rows).
+ * - super admin: every row.
+ */
+function branchScopeFilter(req) {
+  const bound = branchId(req);
+  if (bound) return { branch_id: bound };
+  if (req.user?.role === 'super') return {};
+  return { $null: ['branch_id'] };
+}
+
+/** True when a row with this branch_id is inside the caller's scope (see branchScopeFilter). */
+function rowInBranchScope(req, rowBranchId) {
+  const bound = branchId(req);
+  if (bound) return rowBranchId !== null && rowBranchId !== undefined && String(rowBranchId) === String(bound);
+  if (req.user?.role === 'super') return true;
+  return rowBranchId === null || rowBranchId === undefined || rowBranchId === '';
+}
+
 function requireRestaurantScope(req, res, next) {
   try {
     const rid = restaurantId(req);
@@ -136,8 +170,29 @@ function requireRestaurantScope(req, res, next) {
   }
 }
 
+
+/**
+ * Customer-only guard for customer-facing routes (the OAuth customer login). Staff tokens are refused here, and
+ * customer tokens are refused by requireAuth, so the two can never be mixed up. The customer row is checked by the route.
+ */
+function requireCustomer(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return next(unauthorized('Missing token'));
+  let claims;
+  try {
+    claims = verify(token);
+  } catch (e) {
+    return next(unauthorized('Invalid or expired token'));
+  }
+  if (claims.role !== 'customer' || !claims.sub || !claims.restaurant_id) return next(forbidden('Customer sign-in required'));
+  req.customer = { id: String(claims.sub), restaurant_id: String(claims.restaurant_id), name: claims.name || null };
+  next();
+}
+
 module.exports = {
   optionalAuth,
+  requireCustomer,
   requireAuth,
   requireRole,
   restaurantId,
@@ -146,5 +201,7 @@ module.exports = {
   assertTillAccess,
   branchId,
   assertBranchAccess,
+  branchScopeFilter,
+  rowInBranchScope,
   requireRestaurantScope,
 };

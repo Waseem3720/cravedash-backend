@@ -2,14 +2,16 @@ const express = require('express');
 const pool = require('@cravedash/shared/src/db');
 const { ok } = require('@cravedash/shared/src/response');
 const asyncHandler = require('@cravedash/shared/src/asyncHandler');
-const { notFound, badRequest, forbidden } = require('@cravedash/shared/src/errors');
+const { notFound, badRequest, forbidden, AppError } = require('@cravedash/shared/src/errors');
 const { restaurantId } = require('@cravedash/shared/src/authMiddleware');
+
+function conflictError(message) {
+  return new AppError(message, 409, 'CONFLICT');
+}
 const {
   getStripe,
   loadStripeConfig,
-  saveStripeConfig,
   resolveWebhookSecret,
-  touchWebhookHealth,
   appBaseUrl,
   apiBaseUrl,
   clearStripeCache,
@@ -79,6 +81,15 @@ function assertRestaurantAccess(req, rid) {
   const own = restaurantId(req);
   if (!own || own !== rid) throw forbidden('Restaurant scope required');
   return rid;
+}
+
+/**
+ * A branch login may act only on orders of its own branch (BUG-022). Restaurant-level scope alone is not enough.
+ * Super admins and restaurant owners (no branch_id) are not limited here.
+ */
+function assertOrderBranchScope(req, order) {
+  if (req.user?.role === 'super' || !req.user?.branch_id) return;
+  if (String(order.branch_id || '') !== String(req.user.branch_id)) throw forbidden('This order belongs to another branch');
 }
 
 function resolveTargetRestaurantId(req, bodyRid) {
@@ -236,6 +247,19 @@ router.post(
       if (String(order.restaurant_id) !== String(rid)) {
         throw forbidden('Order belongs to another restaurant');
       }
+      assertOrderBranchScope(req, order);
+      // SEC-M13: no new payment for an order that is paid, refunded or cancelled, and a stored PaymentIntent id is never replaced.
+      const paymentState = String(order.payment_status || '').toLowerCase();
+      const orderState = String(order.status || '').toLowerCase();
+      if (['paid', 'partially_refunded', 'refunded'].includes(paymentState)) {
+        throw conflictError('Order is already paid or refunded; no payment can be taken');
+      }
+      if (['canceled', 'cancelled', 'refunded', 'returned'].includes(orderState)) {
+        throw conflictError('Order is cancelled or returned; no payment can be taken');
+      }
+      if (order.data && order.data.stripe_payment_intent_id) {
+        throw conflictError('Order already has a payment intent; it is not replaced');
+      }
       // Never trust client amount when order is known — bind to DB total (+ optional tip)
       amount = +order.total || 0;
       const tip = body.tip != null ? +body.tip : 0;
@@ -266,9 +290,7 @@ router.post(
     });
 
     if (orderId) {
-      const prevData = order.data && typeof order.data === 'object' ? order.data : {};
       const nextData = {
-        ...prevData,
         stripe_payment_intent_id: intent.id,
         stripe_rail: metadata.rail,
         charge_mode: mode,
@@ -281,11 +303,20 @@ router.post(
           : null,
         transfer_group: intent.transfer_group || (orderId ? `order_${orderId}` : null),
       };
-      await pool.query(
-        `UPDATE orders SET data = $2::jsonb, payment_method = COALESCE(payment_method, 'stripe'), updated_at = NOW()
-         WHERE id = $1`,
+      // Merge only the payment keys, and only while the order is still unpaid with no intent stored (SEC-M13).
+      const { rows: stored } = await pool.query(
+        `UPDATE orders SET data = COALESCE(data, '{}'::jsonb) || $2::jsonb,
+                payment_method = COALESCE(payment_method, 'stripe'), updated_at = NOW()
+         WHERE id = $1
+           AND NOT (COALESCE(data, '{}'::jsonb) ? 'stripe_payment_intent_id')
+           AND LOWER(COALESCE(payment_status, '')) NOT IN ('paid', 'partially_refunded', 'refunded')
+         RETURNING id`,
         [orderId, JSON.stringify(nextData)],
       );
+      if (!stored[0]) {
+        logStripe('payment_intent.not_stored', { order_id: orderId, intent_id: intent.id });
+        throw conflictError('Order changed while the payment was being prepared; no payment was stored');
+      }
     }
 
     ok(res, {
@@ -430,7 +461,31 @@ router.post(
     if (['paid', 'rejected', 'canceled'].includes(String(payout.status).toLowerCase())) {
       throw badRequest(`Payout already ${payout.status}`);
     }
+    // P1: claim the payout before any transfer. Two executes (double click, retry, two admins) cannot both get past this.
+    // A claim left 'processing' by a crash is taken over after 10 minutes. The Stripe idempotency key makes that retry safe.
+    const { rows: claimed } = await pool.query(
+      `UPDATE payouts SET status = 'processing', updated_at = NOW()
+       WHERE id = $1 AND (
+         LOWER(status) NOT IN ('paid', 'rejected', 'canceled', 'processing')
+         OR (LOWER(status) = 'processing' AND updated_at < NOW() - INTERVAL '10 minutes')
+       )
+       RETURNING id`,
+      [payout.id],
+    );
+    if (!claimed[0]) throw conflictError('Payout is already being processed or has been paid');
+    const restoreTo = String(payout.status).toLowerCase() === 'processing' ? 'pending' : payout.status;
+    try {
+      return await runPayoutExecution(req, res, { ...payout, status: restoreTo });
+    } catch (err) {
+      // Release the claim so the payout can be retried.
+      await pool.query(`UPDATE payouts SET status = $2, updated_at = NOW() WHERE id = $1 AND status = 'processing'`, [payout.id, restoreTo])
+        .catch((releaseErr) => console.error('[payouts] could not release claim', releaseErr));
+      throw err;
+    }
+  }),
+);
 
+async function runPayoutExecution(req, res, payout) {
     const restaurant = await loadRestaurant(payout.restaurant_id);
     const billing = billingOf(restaurant);
     const amount = +(payout.amount || 0);
@@ -439,6 +494,7 @@ router.post(
     const data = payout.data && typeof payout.data === 'object' ? payout.data : {};
     const kind = data.kind || payout.kind || 'request';
     const { stripe } = await getStripe();
+    const idempotencyKey = `payout-${payout.id}`;
 
     // Period batches (held orders) — Transfer via shared helper (order ledger already attached)
     if (kind === 'period_payout' || billing.account === 'cravedash') {
@@ -450,6 +506,7 @@ router.post(
       if (kind === 'period_payout' || data.order_ids) {
         const updated = await connect.executePayoutTransfer(stripe, { ...payout, data }, {
           by: req.user?.email || 'super',
+          idempotencyKey,
         });
         return ok(res, {
           ...updated,
@@ -469,7 +526,7 @@ router.post(
         currency: String(restaurant.currency || 'gbp').toLowerCase(),
         destination: dest,
         metadata: { payout_id: payout.id, restaurant_id: payout.restaurant_id, kind: String(kind) },
-      });
+      }, { idempotencyKey });
       const { rows: updated } = await pool.query(
         `UPDATE payouts
          SET status = 'paid', ref = $2, paid_at = NOW(), data = $3::jsonb, updated_at = NOW()
@@ -507,8 +564,7 @@ router.post(
       ],
     );
     ok(res, { ...updated[0], restaurant: restaurant.name, kind, stripe_transfer_id: null });
-  }),
-);
+}
 
 // ---- Refunds via Stripe (Connect-aware / proportional) ----
 router.post(
@@ -519,6 +575,10 @@ router.post(
     }
     const body = req.body || {};
     const refundRequestId = body.refund_request_id || body.id;
+    // Tenants open refund requests; only platform admins may approve and execute one (SEC-C4).
+    if (refundRequestId && req.user?.role !== 'super') {
+      throw forbidden('Only platform admins can execute a refund request');
+    }
     let orderId = body.order_id;
     let amount = body.amount != null ? +body.amount : null;
     let paymentIntentId = body.payment_intent_id || body.stripe_payment_intent_id;
@@ -546,17 +606,37 @@ router.post(
       order = rows[0];
       if (!order) throw notFound('Order not found');
       if (req.user?.role !== 'super') assertRestaurantAccess(req, order.restaurant_id);
+      assertOrderBranchScope(req, order);
       const od = order.data && typeof order.data === 'object' ? order.data : {};
       paymentIntentId = paymentIntentId || od.stripe_payment_intent_id;
       if (amount == null) amount = +order.total;
+      // A refund can never exceed the order total (review finding, roadmap 1.1).
+      if (amount != null && (!(amount > 0) || amount > +order.total + 0.005)) {
+        throw badRequest('Refund amount must be positive and not exceed the order total');
+      }
+      // Fast pre-check so an over-refund is refused before any Stripe call. The locked check below is the real guard.
+      const alreadyRefunded = Number(od.refund_amount || 0);
+      const remaining = Math.round((+order.total - alreadyRefunded) * 100) / 100;
+      if (amount > remaining + 0.005) {
+        throw badRequest(`Only ${Math.max(0, remaining).toFixed(2)} can still be refunded on this order`);
+      }
     }
 
+    // Tenants may refund only payments that belong to an order of their own restaurant (audit 06, roadmap 1.1).
+    const tenantScoped = req.user?.role !== 'super';
+    if (tenantScoped && body.stripe_account) {
+      throw forbidden('stripe_account is not allowed for a restaurant refund');
+    }
     if (!order && paymentIntentId) {
       const { rows } = await pool.query(
-        `SELECT * FROM orders WHERE data->>'stripe_payment_intent_id' = $1 LIMIT 1`,
-        [paymentIntentId],
+        `SELECT * FROM orders WHERE data->>'stripe_payment_intent_id' = $1 ${tenantScoped ? 'AND restaurant_id = $2' : ''} LIMIT 1`,
+        tenantScoped ? [paymentIntentId, req.user.restaurant_id] : [paymentIntentId],
       );
       order = rows[0] || null;
+      if (order) assertOrderBranchScope(req, order);
+    }
+    if (tenantScoped && !order && paymentIntentId) {
+      throw notFound('No order with this payment in your restaurant');
     }
 
     if (!paymentIntentId && !order) {
@@ -569,12 +649,40 @@ router.post(
     if (order) {
       const restaurant = await loadRestaurant(order.restaurant_id);
       const billing = billingOf(restaurant);
-      result = await connect.createConnectRefund(stripe, {
-        order,
-        amount,
-        reason: body.reason || 'requested_by_customer',
-        billing,
-      });
+      // Cumulative cap (SEC-H11): the order row is locked so two refunds cannot both pass the check.
+      // The amount is reserved in orders.data.refund_amount in the same transaction as the Stripe call.
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const { rows: locked } = await client.query(
+          'SELECT total, data FROM orders WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+          [order.id, order.restaurant_id],
+        );
+        if (!locked[0]) throw notFound('Order not found');
+        const alreadyRefunded = Number((locked[0].data && locked[0].data.refund_amount) || 0);
+        const remaining = Math.round((Number(locked[0].total) - alreadyRefunded) * 100) / 100;
+        if (!(amount > 0) || amount > remaining + 0.005) {
+          throw badRequest(`Only ${Math.max(0, remaining).toFixed(2)} can still be refunded on this order`);
+        }
+        result = await connect.createConnectRefund(stripe, {
+          order,
+          amount,
+          reason: body.reason || 'requested_by_customer',
+          billing,
+        });
+        await client.query(
+          `UPDATE orders
+           SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('refund_amount', $2::numeric), updated_at = NOW()
+           WHERE id = $1`,
+          [order.id, Math.round((alreadyRefunded + amount) * 100) / 100],
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
     } else {
       // Orphan PI refund (no order row) — still apply Connect flags when account known
       const params = {
@@ -821,6 +929,9 @@ async function handleStripeEvent(event) {
           }
         } catch (err) {
           logStripe('held_payout.enqueue_failed', { order_id: orderId, error: err.message });
+          // Rethrow (SEC-H10): the webhook then returns 500, Stripe retries, and the event is logged only after success.
+          // The enqueue is idempotent (payout_status check), so a retry cannot create a second payout.
+          throw err;
         }
       }
     }
@@ -935,13 +1046,85 @@ async function handleStripeEvent(event) {
   }
 }
 
+/**
+ * SEC-M12: config keys are written with jsonb_set, one key per statement, so a save of another key is not overwritten.
+ */
+async function ensureStripeConfigRow() {
+  await pool.query("INSERT INTO stripe_config (id, data, updated_at) VALUES (1, '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING");
+}
+
+async function patchWebhookHealth(patch) {
+  await ensureStripeConfigRow();
+  const { rows } = await pool.query(
+    `UPDATE stripe_config
+        SET data = jsonb_set(data, '{webhook_health}',
+              COALESCE(data->'webhook_health', '{}'::jsonb) || $1::jsonb, true),
+            updated_at = NOW()
+      WHERE id = 1
+      RETURNING data->'webhook_health' AS health`,
+    [JSON.stringify({ ...patch, updated_at: new Date().toISOString() })],
+  );
+  return rows[0]?.health;
+}
+
+/** Recent events for display only (the dedupe source is stripe_webhook_events). Bounded to 50 entries. */
+async function appendWebhookLog(entry) {
+  await ensureStripeConfigRow();
+  await pool.query(
+    `UPDATE stripe_config
+        SET data = jsonb_set(data, '{webhook_events_log}', (
+              SELECT COALESCE(jsonb_agg(e.value ORDER BY e.ord), '[]'::jsonb)
+                FROM (
+                  SELECT $1::jsonb AS value, 0 AS ord
+                  UNION ALL
+                  SELECT v.value, v.ord
+                    FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(data->'webhook_events_log') = 'array'
+                           THEN data->'webhook_events_log' ELSE '[]'::jsonb END
+                    ) WITH ORDINALITY AS v(value, ord)
+                   WHERE v.ord <= 49
+                ) e
+            ), true),
+            updated_at = NOW()
+      WHERE id = 1`,
+    [JSON.stringify(entry)],
+  );
+}
+
+const WEBHOOK_STALE_CLAIM_SQL = "INTERVAL '5 minutes'";
+
+/**
+ * SEC-M12: the event id is claimed with INSERT ... ON CONFLICT DO NOTHING before anything is processed.
+ * Returns 'claimed' (process it), 'duplicate' (already done: acknowledge), or 'in_progress' (another delivery is working on it).
+ * A claim left 'processing' by a crashed attempt is taken over after WEBHOOK_STALE_CLAIM_SQL.
+ */
+async function claimStripeEvent(event) {
+  const { rows: inserted } = await pool.query(
+    `INSERT INTO stripe_webhook_events (event_id, event_type, status, claimed_at)
+     VALUES ($1, $2, 'processing', NOW())
+     ON CONFLICT (event_id) DO NOTHING
+     RETURNING event_id`,
+    [event.id, event.type || null],
+  );
+  if (inserted[0]) return 'claimed';
+  const { rows } = await pool.query('SELECT status FROM stripe_webhook_events WHERE event_id = $1', [event.id]);
+  if (rows[0] && rows[0].status === 'done') return 'duplicate';
+  const { rows: taken } = await pool.query(
+    `UPDATE stripe_webhook_events SET claimed_at = NOW()
+      WHERE event_id = $1 AND status = 'processing' AND claimed_at < NOW() - ${WEBHOOK_STALE_CLAIM_SQL}
+     RETURNING event_id`,
+    [event.id],
+  );
+  return taken[0] ? 'claimed' : 'in_progress';
+}
+
 /** Raw-body webhook — mounted from index.js without auth */
 async function stripeWebhookHandler(req, res) {
   try {
     const config = await loadStripeConfig();
     const secret = resolveWebhookSecret(config);
     if (!secret) {
-      await touchWebhookHealth({ ok: false, last_error: 'webhook secret missing' });
+      await patchWebhookHealth({ ok: false, last_error: 'webhook secret missing' });
       return res.status(400).json({ success: false, error: { message: 'Webhook secret not configured' } });
     }
     const { stripe } = await getStripe();
@@ -952,34 +1135,51 @@ async function stripeWebhookHandler(req, res) {
     try {
       event = stripe.webhooks.constructEvent(payload, sig, secret);
     } catch (err) {
-      await touchWebhookHealth({ ok: false, last_error: err.message, last_at: new Date().toISOString() });
+      await patchWebhookHealth({ ok: false, last_error: err.message, last_at: new Date().toISOString() });
       return res.status(400).json({ success: false, error: { message: `Webhook signature: ${err.message}` } });
     }
 
-    await handleStripeEvent(event);
-    await touchWebhookHealth({
+    // Stripe retries deliveries. A processed event is acknowledged without side effects (a replay must not pay an
+    // order twice or record fees twice). An event still being processed is answered 409 so Stripe retries later.
+    const claim = await claimStripeEvent(event);
+    if (claim === 'duplicate') return res.json({ received: true, duplicate: true });
+    if (claim === 'in_progress') {
+      return res.status(409).json({ success: false, error: { code: 'CONFLICT', message: 'Event is already being processed' } });
+    }
+
+    try {
+      await handleStripeEvent(event);
+    } catch (err) {
+      // Release the claim so the next delivery processes the event again.
+      await pool.query(
+        "DELETE FROM stripe_webhook_events WHERE event_id = $1 AND status = 'processing'",
+        [event.id],
+      ).catch((e) => console.error('[stripe webhook] could not release the claim', e));
+      throw err;
+    }
+    await pool.query(
+      "UPDATE stripe_webhook_events SET status = 'done', processed_at = NOW() WHERE event_id = $1",
+      [event.id],
+    );
+    await patchWebhookHealth({
       ok: true,
       last_error: null,
       last_type: event.type,
       last_id: event.id,
       last_at: new Date().toISOString(),
     });
-
-    // Keep event log (bounded) on stripe_config
-    const cfg = await loadStripeConfig();
-    const log = Array.isArray(cfg.webhook_events_log) ? cfg.webhook_events_log.slice(0, 49) : [];
-    log.unshift({ id: event.id, type: event.type, at: new Date().toISOString() });
-    await saveStripeConfig({ ...cfg, webhook_events_log: log });
+    await appendWebhookLog({ id: event.id, type: event.type, at: new Date().toISOString() });
 
     return res.json({ received: true });
   } catch (err) {
     console.error('[stripe webhook]', err);
     try {
-      await touchWebhookHealth({ ok: false, last_error: err.message, last_at: new Date().toISOString() });
+      await patchWebhookHealth({ ok: false, last_error: err.message, last_at: new Date().toISOString() });
     } catch {
-      /* ignore */
+      /* the health write is best effort; the failure is already logged */
     }
-    return res.status(500).json({ success: false, error: { message: err.message || 'Webhook error' } });
+    // SEC-M16: no database or provider text goes back to Stripe or to a caller.
+    return res.status(500).json({ success: false, error: { code: 'INTERNAL_ERROR', message: 'Webhook could not be processed' } });
   }
 }
 

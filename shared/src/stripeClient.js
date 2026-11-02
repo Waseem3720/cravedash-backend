@@ -83,18 +83,20 @@ async function getStripe() {
   };
 }
 
+/** Merges health fields in one atomic statement, so two webhook deliveries cannot overwrite each other. */
 async function touchWebhookHealth(patch) {
-  const config = await loadStripeConfig();
-  const next = {
-    ...config,
-    webhook_health: {
-      ...(config.webhook_health || {}),
-      ...patch,
-      updated_at: new Date().toISOString(),
-    },
-  };
-  await saveStripeConfig(next);
-  return next.webhook_health;
+  const health = { ...(patch || {}), updated_at: new Date().toISOString() };
+  const { rows } = await pool.query(
+    `INSERT INTO stripe_config (id, data, updated_at) VALUES (1, jsonb_build_object('webhook_health', $1::jsonb), NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       data = jsonb_set(COALESCE(stripe_config.data, '{}'::jsonb), '{webhook_health}',
+                        COALESCE(stripe_config.data->'webhook_health', '{}'::jsonb) || $1::jsonb),
+       updated_at = NOW()
+     RETURNING data->'webhook_health' AS webhook_health`,
+    [JSON.stringify(health)],
+  );
+  cache.config = null;
+  return rows[0].webhook_health;
 }
 
 function appBaseUrl(req) {

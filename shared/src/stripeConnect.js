@@ -9,7 +9,9 @@
  *   Charge on the connected account with application_fee_amount
  *   (platform fee + commission) taken at charge time.
  */
+const crypto = require('crypto');
 const pool = require('./db');
+const accounting = require('./engines/accounting');
 
 const BILLING_DEF = {
   commission_type: 'percent',
@@ -556,6 +558,17 @@ async function createConnectRefund(stripe, {
   const refundAmount = amount != null && amount > 0 ? round2(amount) : orderTotal;
   const isPartial = refundAmount + 0.009 < orderTotal;
   const ratio = orderTotal > 0 ? Math.min(1, refundAmount / orderTotal) : 1;
+  // BUG-008: a refund may never exceed what is still refundable on the order (the Stripe charge is the hard limit too).
+  const alreadyRefunded = round2(+(order.refund_amount || od.refund_amount || 0));
+  const remainingRefundable = round2(orderTotal - alreadyRefunded);
+  if (refundAmount > remainingRefundable + 0.009) {
+    const err = new Error(`Refund exceeds the remaining refundable amount (${remainingRefundable.toFixed(2)})`);
+    err.status = 400;
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+  // Same key for a retried identical refund, so Stripe returns the first refund instead of making a second one.
+  const refundKey = `refund-${order.id}-${alreadyRefunded}-${refundAmount}`;
 
   const result = {
     mode,
@@ -610,78 +623,14 @@ async function createConnectRefund(stripe, {
       stripe_account: stripeAccount,
     });
   } else {
-    // Option A — platform charge
-    // 1) Deduct refund from held / pending-approval payout (before funds leave platform)
-    if (od.payout_status === 'held' || od.payout_status === 'batched' || !od.payout_status) {
-      await applyRefundToHeldOrder(order, refundAmount, reason);
-      result.canceled_payouts = [{ id: String(order.id), adjusted: true }];
-    }
-
-    // 2) If already paid out in a period batch, reverse vendor Transfer proportionally
-    const { rows: paidOut } = await pool.query(
-      `SELECT * FROM payouts
-       WHERE restaurant_id = $1
-         AND data->>'kind' = 'period_payout'
-         AND status = 'paid'
-         AND data->>'stripe_transfer_id' IS NOT NULL
-         AND data->'order_ids' @> to_jsonb($2::text)
-       ORDER BY paid_at DESC NULLS LAST
-       LIMIT 1`,
-      [order.restaurant_id, String(order.id)],
-    );
-    if (paidOut[0]) {
-      const transferId = paidOut[0].data.stripe_transfer_id || paidOut[0].ref;
-      const orderShare = (paidOut[0].data.order_summaries || []).find(
-        (s) => String(s.order_id) === String(order.id),
-      );
-      const reverseCents = toCents(
-        isPartial
-          ? round2((orderShare ? +orderShare.net : +paidOut[0].amount) * ratio)
-          : (orderShare ? +orderShare.net : null),
-      );
-      try {
-        result.transfer_reversal = await reverseVendorTransfer(
-          stripe,
-          transferId,
-          reverseCents > 0 ? reverseCents : null,
-          { order_id: String(order.id), payout_id: paidOut[0].id, reason: 'order_refund' },
-        );
-        await pool.query(
-          `UPDATE payouts
-           SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW()
-           WHERE id = $1`,
-          [
-            paidOut[0].id,
-            JSON.stringify({
-              post_pay_refunds: [
-                ...((paidOut[0].data.post_pay_refunds) || []),
-                {
-                  order_id: String(order.id),
-                  amount: refundAmount,
-                  reversal_id: result.transfer_reversal.id,
-                  at: new Date().toISOString(),
-                },
-              ],
-            }),
-          ],
-        );
-      } catch (err) {
-        logStripe('transfer.reverse_failed', {
-          transfer_id: transferId,
-          order_id: order.id,
-          error: err.message,
-        });
-        throw err;
-      }
-    }
-
-    // 3) Refund the platform PaymentIntent (customer gets money back)
+    // Option A — platform charge.
+    // The customer refund runs first. If Stripe refuses it, nothing on the vendor side has changed yet (BUG-008).
     const params = {
       payment_intent: paymentIntentId,
       reason,
     };
     if (isPartial) params.amount = toCents(refundAmount);
-    result.refund = await stripe.refunds.create(params);
+    result.refund = await stripe.refunds.create(params, { idempotencyKey: refundKey });
 
     logStripe('refund.platform_first', {
       refund_id: result.refund.id,
@@ -689,8 +638,82 @@ async function createConnectRefund(stripe, {
       order_id: order.id,
       amount_cents: result.refund.amount,
       partial: isPartial,
-      transfer_reversal_id: result.transfer_reversal && result.transfer_reversal.id,
     });
+
+    // Vendor side: deduct from the held payout and reverse a Transfer that was already sent. If this fails the
+    // customer has been refunded, so the order is flagged for reconciliation and the refund itself still stands.
+    try {
+      // 1) Deduct refund from held / pending-approval payout (before funds leave platform)
+      if (od.payout_status === 'held' || od.payout_status === 'batched' || !od.payout_status) {
+        await applyRefundToHeldOrder(order, refundAmount, reason);
+        result.canceled_payouts = [{ id: String(order.id), adjusted: true }];
+      }
+
+      // 2) If already paid out in a period batch, reverse vendor Transfer proportionally
+      const { rows: paidOut } = await pool.query(
+        `SELECT * FROM payouts
+         WHERE restaurant_id = $1
+           AND data->>'kind' = 'period_payout'
+           AND status = 'paid'
+           AND data->>'stripe_transfer_id' IS NOT NULL
+           AND data->'order_ids' @> to_jsonb($2::text)
+         ORDER BY paid_at DESC NULLS LAST
+         LIMIT 1`,
+        [order.restaurant_id, String(order.id)],
+      );
+      if (paidOut[0]) {
+        const transferId = paidOut[0].data.stripe_transfer_id || paidOut[0].ref;
+        const orderShare = (paidOut[0].data.order_summaries || []).find(
+          (s) => String(s.order_id) === String(order.id),
+        );
+        const reverseCents = toCents(
+          isPartial
+            ? round2((orderShare ? +orderShare.net : +paidOut[0].amount) * ratio)
+            : (orderShare ? +orderShare.net : null),
+        );
+        try {
+          result.transfer_reversal = await reverseVendorTransfer(
+            stripe,
+            transferId,
+            reverseCents > 0 ? reverseCents : null,
+            { order_id: String(order.id), payout_id: paidOut[0].id, reason: 'order_refund' },
+          );
+          await pool.query(
+            `UPDATE payouts
+             SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW()
+             WHERE id = $1`,
+            [
+              paidOut[0].id,
+              JSON.stringify({
+                post_pay_refunds: [
+                  ...((paidOut[0].data.post_pay_refunds) || []),
+                  {
+                    order_id: String(order.id),
+                    amount: refundAmount,
+                    reversal_id: result.transfer_reversal.id,
+                    at: new Date().toISOString(),
+                  },
+                ],
+              }),
+            ],
+          );
+        } catch (err) {
+          logStripe('transfer.reverse_failed', {
+            transfer_id: transferId,
+            order_id: order.id,
+            error: err.message,
+          });
+          throw err;
+        }
+      }
+    } catch (err) {
+      result.vendor_adjustment_pending = true;
+      logStripe('refund.vendor_adjustment_pending', { order_id: order.id, error: err.message });
+      await pool.query(
+        `UPDATE orders SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+        [order.id, JSON.stringify({ vendor_adjustment_pending: { refund_id: result.refund.id, error: String(err.message || '').slice(0, 200) } })],
+      ).catch(() => {});
+    }
   }
 
   // Persist refund on order (support partials). refund_amount column may be absent on older DBs.
@@ -725,6 +748,23 @@ async function createConnectRefund(stripe, {
     );
   }
 
+  // BUG-017: the sale in the ledger gives back the refunded share. The customer has already been refunded at this point, so
+  // a posting failure is flagged on the order for reconciliation instead of hiding the refund.
+  try {
+    await accounting.postRefundSale(order.restaurant_id, { ...order, total: orderTotal }, {
+      refundAmount,
+      refundKey: result.refund.id,
+      fullyRefunded,
+    });
+  } catch (err) {
+    result.refund_journal_pending = true;
+    await pool.query(
+      `UPDATE orders SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [order.id, JSON.stringify({ refund_journal_pending: { refund_id: result.refund.id, error: String(err.message || '').slice(0, 200) } })],
+    ).catch(() => {});
+    logStripe('refund.journal_pending', { order_id: order.id, refund_id: result.refund.id, error: err.message });
+  }
+
   return result;
 }
 
@@ -734,19 +774,25 @@ async function createConnectRefund(stripe, {
  *   - pending_approval (default) → shows in Payouts for admin Approve
  *   - paid immediately if billing.payout_mode === 'automate'
  */
-async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
-  await ensurePayoutsTable();
+/**
+ * Builds one period payout from due held orders. The selection, the payout row and the order claim happen in one
+ * transaction on `client`. Held orders are locked with SKIP LOCKED, so a concurrent run skips them, and a claimed order
+ * is marked `batched` with its payout id before the transaction commits. No order can belong to two payouts.
+ */
+async function buildPeriodPayoutInTx(client, restaurant, billing) {
   const rid = restaurant.id;
-  const { rows: held } = await pool.query(
+  const { rows: held } = await client.query(
     `SELECT * FROM orders
      WHERE restaurant_id = $1
        AND payment_status IN ('paid', 'partially_refunded')
        AND COALESCE(data->>'charge_mode', data->>'stripe_rail', 'platform_first') IN ('platform_first', 'cravedash')
        AND COALESCE(data->>'payout_status', '') = 'held'
+       AND COALESCE(data->>'held_payout_id', '') = ''
        AND COALESCE(data->>'payout_release_at', '') <> ''
        AND (data->>'payout_release_at')::timestamptz <= NOW()
      ORDER BY created_at ASC
-     LIMIT 500`,
+     LIMIT 500
+     FOR UPDATE SKIP LOCKED`,
     [rid],
   );
   if (!held.length) return null;
@@ -756,7 +802,7 @@ async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
   if (!eligible.length) {
     // All fully refunded — mark excluded
     for (const o of held) {
-      await pool.query(
+      await client.query(
         `UPDATE orders SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
         [o.id, JSON.stringify({ payout_status: 'excluded' })],
       );
@@ -778,7 +824,7 @@ async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
 
   const automate = payoutModeOf(billing) === 'automate';
   const dest = billing.stripe_account || restaurant.stripe_account || null;
-  const id = `po_period_${rid}_${Date.now().toString(36)}`;
+  const id = `po_period_${rid}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
   const orderIds = eligible.map((s) => s.order_id);
   const data = {
     kind: 'period_payout',
@@ -810,31 +856,20 @@ async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
     ? `Auto payout (${eligible.length} orders) — Stripe fee £${totals.stripe_fee.toFixed(2)} deducted`
     : `Ready for approval (${eligible.length} orders). Stripe fee £${totals.stripe_fee.toFixed(2)} + commission £${totals.commission.toFixed(2)} deducted.`;
 
-  const { rows } = await pool.query(
+  const { rows } = await client.query(
     `INSERT INTO payouts (id, restaurant_id, amount, status, note, data)
      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
      RETURNING *`,
     [id, rid, totals.net, status, note, JSON.stringify(data)],
   );
 
-  // Mark orders batched
-  await pool.query(
+  // Claim the orders for this payout. orders.id is BIGINT, so the comparison is made on text.
+  await client.query(
     `UPDATE orders
      SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW()
-     WHERE id = ANY($1::text[])`,
+     WHERE id::text = ANY($1::text[])`,
     [orderIds, JSON.stringify({ payout_status: 'batched', held_payout_id: id })],
-  ).catch(async () => {
-    // bigint ids fallback
-    const nums = orderIds.map(Number).filter(Number.isFinite);
-    if (nums.length) {
-      await pool.query(
-        `UPDATE orders
-         SET data = COALESCE(data,'{}'::jsonb) || $2::jsonb, updated_at = NOW()
-         WHERE id = ANY($1::bigint[])`,
-        [nums, JSON.stringify({ payout_status: 'batched', held_payout_id: id })],
-      );
-    }
-  });
+  );
 
   logStripe('period_payout.created', {
     payout_id: id,
@@ -846,17 +881,95 @@ async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
     automate,
   });
 
-  let payout = rows[0];
-  if (automate && stripe) {
-    payout = await executePayoutTransfer(stripe, payout, { by: 'automate' });
-  }
-  return payout;
+  return rows[0];
+}
+
+/** Stripe errors that mean the Transfer was refused and never created. Any other error may have created it. */
+const STRIPE_REJECTED_TYPES = new Set([
+  'StripeInvalidRequestError',
+  'StripeCardError',
+  'StripeAuthenticationError',
+  'StripePermissionError',
+]);
+
+function isStripeRejection(err) {
+  return Boolean(err && STRIPE_REJECTED_TYPES.has(err.type || err.name));
 }
 
 /**
- * Stripe Transfer for an approved / automate period payout.
+ * Builds a period payout and, in automate mode, sends its Transfer. The claim is taken in a transaction first. The
+ * Transfer runs after the commit, so no database lock is held during the Stripe call.
+ * A refused Transfer releases the orders to `held`. Any other failure keeps the claim, because the Transfer may already
+ * exist. A retry with the same payout key returns that Transfer and never sends a second one.
  */
-async function executePayoutTransfer(stripe, payout, { by = 'admin' } = {}) {
+async function buildPeriodPayoutForRestaurant(stripe, restaurant, billing) {
+  await ensurePayoutsTable();
+  const automate = payoutModeOf(billing) === 'automate';
+  if (automate && !(billing.stripe_account || restaurant.stripe_account)) {
+    // Checked before anything is claimed, so no order is left batched without a Transfer.
+    const err = new Error('Restaurant must complete Stripe Connect before payout');
+    err.status = 400;
+    throw err;
+  }
+
+  const client = await pool.connect();
+  let payout;
+  try {
+    await client.query('BEGIN');
+    payout = await buildPeriodPayoutInTx(client, restaurant, billing);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  if (!payout || !automate || !stripe) return payout;
+
+  const orderIds = (Array.isArray(payout.data?.order_ids) ? payout.data.order_ids : []).map(String);
+  try {
+    return await executePayoutTransfer(stripe, payout, { by: 'automate' });
+  } catch (err) {
+    if (isStripeRejection(err)) await releaseRefusedPayout(payout.id, orderIds);
+    throw err;
+  }
+}
+
+/** Returns the orders of a refused payout to `held`, so the next run can batch them again. */
+async function releaseRefusedPayout(payoutId, orderIds) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE payouts
+       SET status = 'failed', updated_at = NOW(),
+           note = COALESCE(note, '') || ' (Stripe refused the transfer; orders released)'
+       WHERE id = $1 AND status = 'approved' AND ref IS NULL
+       RETURNING id`,
+      [payoutId],
+    );
+    if (rows[0] && orderIds.length) {
+      await client.query(
+        `UPDATE orders
+         SET data = (COALESCE(data,'{}'::jsonb) - 'held_payout_id') || $3::jsonb, updated_at = NOW()
+         WHERE id::text = ANY($1::text[]) AND data->>'held_payout_id' = $2`,
+        [orderIds, payoutId, JSON.stringify({ payout_status: 'held' })],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Stripe Transfer for an approved / automate period payout. The Stripe key is the payout id, so every attempt for the
+ * same payout reuses one Transfer.
+ */
+async function executePayoutTransfer(stripe, payout, { by = 'admin', idempotencyKey } = {}) {
   const data = payout.data && typeof payout.data === 'object' ? payout.data : {};
   const dest = data.stripe_account;
   const amount = +(payout.amount || data.totals?.net || 0);
@@ -876,6 +989,7 @@ async function executePayoutTransfer(stripe, payout, { by = 'admin' } = {}) {
     throw err;
   }
 
+  // The idempotency key is the payout id: a retried execute returns the same Transfer instead of sending a second one.
   const transfer = await stripe.transfers.create({
     amount: toCents(amount),
     currency: String(data.currency || 'gbp').toLowerCase(),
@@ -887,7 +1001,7 @@ async function executePayoutTransfer(stripe, payout, { by = 'admin' } = {}) {
       stripe_fee: String(data.totals?.stripe_fee || 0),
       order_count: String(data.totals?.order_count || 0),
     },
-  });
+  }, { idempotencyKey: idempotencyKey || `payout-${payout.id}` });
 
   const { rows } = await pool.query(
     `UPDATE payouts
@@ -955,10 +1069,27 @@ async function executePayoutTransfer(stripe, payout, { by = 'admin' } = {}) {
  * Cron: for each restaurant, build due period payouts into the approval queue
  * (or auto-Transfer when payout_mode=automate).
  */
-async function releaseDueHeldPayouts(stripe, { limit = 50 } = {}) {
+let releaseInFlight = false;
+
+/**
+ * Releases due held orders into payouts. Only one run per process at a time: a cron tick that starts while a run is
+ * still going (slow Stripe calls) returns at once. Cross-process safety comes from the order claim in the database.
+ */
+async function releaseDueHeldPayouts(stripe, options = {}) {
+  if (releaseInFlight) return { processed: 0, skipped: 'in_progress', results: [] };
+  releaseInFlight = true;
+  try {
+    return await runReleaseDueHeldPayouts(stripe, options);
+  } finally {
+    releaseInFlight = false;
+  }
+}
+
+async function runReleaseDueHeldPayouts(stripe, { limit = 50 } = {}) {
   await ensurePayoutsTable();
   const { rows: restaurants } = await pool.query(
-    `SELECT id, name, currency, data FROM restaurants WHERE status IS DISTINCT FROM FALSE LIMIT $1`,
+    // restaurants has no currency column (currency lives in data, and defaults to GBP in buildPeriodPayoutForRestaurant).
+    `SELECT id, name, data FROM restaurants WHERE status IS DISTINCT FROM FALSE LIMIT $1`,
     [limit],
   );
   const results = [];

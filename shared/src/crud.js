@@ -1,4 +1,4 @@
-const { notFound } = require('./errors');
+const { notFound, forbidden, badRequest, AppError } = require('./errors');
 
 function rowToJson(row) {
   if (!row) return row;
@@ -12,58 +12,122 @@ function rowToJson(row) {
 }
 
 const IDENT = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const ORDER_CLAUSE_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?$/i;
 
-function assertIdent(name) {
-  if (!name || typeof name !== 'string' || !IDENT.test(name)) {
-    throw new Error(`Invalid identifier: ${name}`);
-  }
+function assertIdentName(name) {
+  if (!IDENT.test(name)) throw new Error(`Invalid identifier: ${name}`);
   return name;
 }
 
-function assertOrderBy(orderBy) {
-  if (typeof orderBy !== 'string') {
-    throw new Error(`Invalid orderBy clause: ${orderBy}`);
+/**
+ * SEC-M14: a tenant-scoped table (restaurantColumn configured) is never read or written without the tenant id.
+ * The tenant id comes only from the session (the caller passes it), so a missing id is refused, not treated as "all rows".
+ */
+function requireScope(scopeCol, restaurantId) {
+  if (scopeCol && (restaurantId === undefined || restaurantId === null || restaurantId === '')) {
+    throw forbidden('Restaurant scope required');
   }
-  const str = orderBy.trim();
-  if (!str) throw new Error('orderBy clause cannot be empty');
+}
 
-  const parts = str.split(',').map((p) => p.trim());
-  if (parts.length === 0) throw new Error('orderBy clause cannot be empty');
+function dependantsError(counts) {
+  const parts = Object.entries(counts).map(([label, n]) => `${label}: ${n}`).join(', ');
+  const err = new AppError(`Cannot delete: still in use (${parts})`, 409, 'CONFLICT');
+  err.details = { dependants: counts };
+  return err;
+}
 
-  for (const part of parts) {
-    if (!ORDER_CLAUSE_REGEX.test(part)) {
-      throw new Error(`Invalid orderBy clause: "${part}" in "${orderBy}"`);
+/**
+ * SEC-M8: refuses a delete while child rows still reference the parent. checks: [{ table, column, label,
+ * restaurantColumn }]. restaurantColumn defaults to 'restaurant_id' (the child must belong to restaurantId);
+ * null means the child table is global. Pass a pool or a transaction client as `db`.
+ */
+async function assertNoDependants(db, parentId, checks, restaurantId = null) {
+  const counts = {};
+  for (const check of checks) {
+    const table = assertIdentName(check.table);
+    const column = assertIdentName(check.column);
+    const params = [String(parentId)];
+    let sql = `SELECT COUNT(*)::int AS n FROM ${table} WHERE ${column} = $1`;
+    if (check.restaurantColumn !== null) {
+      const scope = assertIdentName(check.restaurantColumn || 'restaurant_id');
+      requireScope(scope, restaurantId);
+      params.push(restaurantId);
+      sql += ` AND ${scope} = $2`;
     }
+    const { rows } = await db.query(sql, params);
+    const n = rows[0]?.n || 0;
+    if (n > 0) counts[check.label || table] = n;
   }
-  return str;
+  if (Object.keys(counts).length) throw dependantsError(counts);
+}
+
+/**
+ * SEC-M8: delete one row only when no dependant rows exist. The parent row is locked (FOR UPDATE) and the check and
+ * the delete run in one transaction. A child inserted after the check still fails on the foreign key (23503, 409).
+ */
+async function removeWithDependants(pool, opts) {
+  const {
+    table, id, dependants = [], idColumn = 'id', restaurantColumn = 'restaurant_id', restaurantId = null,
+  } = opts;
+  const t = assertIdentName(table);
+  const idc = assertIdentName(idColumn);
+  const params = [String(id)];
+  let where = `${idc} = $1`;
+  if (restaurantColumn) {
+    requireScope(restaurantColumn, restaurantId);
+    params.push(restaurantId);
+    where += ` AND ${assertIdentName(restaurantColumn)} = $2`;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: found } = await client.query(`SELECT 1 FROM ${t} WHERE ${where} FOR UPDATE`, params);
+    if (!found[0]) throw notFound();
+    await assertNoDependants(client, id, dependants, restaurantId);
+    const { rows } = await client.query(`DELETE FROM ${t} WHERE ${where} RETURNING *`, params);
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * SEC-M7: every foreign-key id in the body must name a row of the caller's own restaurant.
+ * refs: { column: 'table' }. A column that is absent, null or '' is not checked (optional link).
+ */
+async function assertTenantRefs(db, restaurantId, body, refs) {
+  requireScope('restaurant_id', restaurantId);
+  for (const [column, table] of Object.entries(refs)) {
+    if (!body || !Object.prototype.hasOwnProperty.call(body, column)) continue;
+    const value = body[column];
+    if (value === undefined || value === null || value === '') continue;
+    const t = assertIdentName(table);
+    const { rows } = await db.query(`SELECT 1 FROM ${t} WHERE id = $1 AND restaurant_id = $2`, [String(value), restaurantId]);
+    if (!rows[0]) throw badRequest(`${column} does not refer to a record of this restaurant`);
+  }
 }
 
 function buildCrud(pool, table, opts = {}) {
-  assertIdent(table);
-  const idCol = opts.idColumn !== undefined ? assertIdent(opts.idColumn) : 'id';
-  const scopeCol = opts.restaurantColumn !== undefined && opts.restaurantColumn !== null
-    ? assertIdent(opts.restaurantColumn)
-    : null;
-  const jsonCols = (opts.jsonColumns || []).map(assertIdent);
-  const orderBy = opts.orderBy !== undefined
-    ? assertOrderBy(opts.orderBy)
-    : assertOrderBy(`${idCol} ASC`);
+  const idCol = opts.idColumn || 'id';
+  const scopeCol = opts.restaurantColumn || null;
+  const jsonCols = opts.jsonColumns || [];
+  const orderBy = opts.orderBy || `${idCol} ASC`;
+  const allowedColumns = opts.allowedColumns || null; // Set/array of writable column names
 
-  let allowedColumns = null;
-  if (opts.allowedColumns) {
-    const list = Array.isArray(opts.allowedColumns)
-      ? opts.allowedColumns
-      : Array.from(opts.allowedColumns);
-    list.forEach(assertIdent);
-    allowedColumns = new Set(list);
+  function assertIdent(name) {
+    if (!IDENT.test(name)) throw new Error(`Invalid column: ${name}`);
+    return name;
   }
 
   function filterPayload(data) {
     const payload = { ...data };
     if (!allowedColumns) return payload;
+    const allow = allowedColumns instanceof Set ? allowedColumns : new Set(allowedColumns);
     Object.keys(payload).forEach((k) => {
-      if (!allowedColumns.has(k) && k !== idCol && k !== scopeCol) delete payload[k];
+      if (!allow.has(k) && k !== idCol && k !== scopeCol) delete payload[k];
     });
     return payload;
   }
@@ -81,15 +145,22 @@ function buildCrud(pool, table, opts = {}) {
   }
 
   async function list(restaurantId, filters = {}) {
+    requireScope(scopeCol, restaurantId);
     const where = [];
     const params = [];
-    if (scopeCol && restaurantId) {
+    if (scopeCol) {
       params.push(restaurantId);
-      where.push(`${scopeCol} = $${params.length}`);
+      where.push(`${assertIdent(scopeCol)} = $${params.length}`);
     }
     Object.entries(filters).forEach(([key, val]) => {
+      if (key === '$null') {
+        // Restaurant-level rows only: { $null: ['branch_id'] } matches rows whose branch column is NULL.
+        (val || []).forEach((col) => where.push(`${assertIdent(col)} IS NULL`));
+        return;
+      }
       if (val === undefined || val === null || val === '') return;
-      if (allowedColumns && !allowedColumns.has(key)) return;
+      if (key === scopeCol) return; // the tenant column is never a filter the caller can choose
+      if (allowedColumns && !(allowedColumns instanceof Set ? allowedColumns : new Set(allowedColumns)).has(key)) return;
       assertIdent(key);
       params.push(val);
       where.push(`${key} = $${params.length}`);
@@ -100,9 +171,10 @@ function buildCrud(pool, table, opts = {}) {
   }
 
   async function getById(id, restaurantId) {
+    requireScope(scopeCol, restaurantId);
     const params = [id];
     let sql = `SELECT * FROM ${table} WHERE ${idCol} = $1`;
-    if (scopeCol && restaurantId) {
+    if (scopeCol) {
       params.push(restaurantId);
       sql += ` AND ${scopeCol} = $2`;
     }
@@ -111,8 +183,13 @@ function buildCrud(pool, table, opts = {}) {
   }
 
   async function create(data, restaurantId) {
+    requireScope(scopeCol, restaurantId);
     const payload = filterPayload({ ...data });
-    if (scopeCol && restaurantId) payload[scopeCol] = restaurantId;
+    // The tenant column always comes from the session, never from the request body.
+    if (scopeCol) {
+      delete payload[scopeCol];
+      payload[scopeCol] = restaurantId;
+    }
     jsonCols.forEach((c) => {
       if (payload[c] !== undefined && typeof payload[c] !== 'string') {
         payload[c] = JSON.stringify(payload[c]);
@@ -126,6 +203,7 @@ function buildCrud(pool, table, opts = {}) {
   }
 
   async function update(id, data, restaurantId) {
+    requireScope(scopeCol, restaurantId);
     const existing = await getById(id, restaurantId);
     if (!existing) throw notFound();
     const payload = filterPayload({ ...data });
@@ -140,10 +218,10 @@ function buildCrud(pool, table, opts = {}) {
     if (!keys.length) return existing;
     const sets = keys.map((k, i) => `${k} = $${i + 2}`);
     const params = [id, ...keys.map((k) => payload[k])];
-    let sql = `UPDATE ${table} SET ${sets.join(', ')}, updated_at = NOW() WHERE ${idCol} = $1`;
-    if (scopeCol && restaurantId) {
+    let sql = `UPDATE ${table} SET ${sets.join(', ')}, updated_at = NOW() WHERE ${assertIdent(idCol)} = $1`;
+    if (scopeCol) {
       params.push(restaurantId);
-      sql += ` AND ${scopeCol} = $${params.length}`;
+      sql += ` AND ${assertIdent(scopeCol)} = $${params.length}`;
     }
     sql += ' RETURNING *';
     const { rows } = await pool.query(sql, params);
@@ -151,9 +229,10 @@ function buildCrud(pool, table, opts = {}) {
   }
 
   async function remove(id, restaurantId) {
+    requireScope(scopeCol, restaurantId);
     const params = [id];
     let sql = `DELETE FROM ${table} WHERE ${idCol} = $1`;
-    if (scopeCol && restaurantId) {
+    if (scopeCol) {
       params.push(restaurantId);
       sql += ` AND ${scopeCol} = $2`;
     }
@@ -166,4 +245,12 @@ function buildCrud(pool, table, opts = {}) {
   return { list, getById, create, update, remove, parseRow };
 }
 
-module.exports = { buildCrud, rowToJson, assertIdent, assertOrderBy };
+module.exports = {
+  buildCrud,
+  rowToJson,
+  requireScope,
+  assertNoDependants,
+  removeWithDependants,
+  assertTenantRefs,
+  dependantsError,
+};

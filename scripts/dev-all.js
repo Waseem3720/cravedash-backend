@@ -69,25 +69,8 @@ async function watchHealth() {
   }
 }
 
-function runMigrations() {
-  return new Promise((resolve, reject) => {
-    console.log('[dev-all] Running pre-startup database migrations...');
-    const m = spawn(process.execPath, [path.join(root, 'shared/scripts/migrate.js')], {
-      cwd: root,
-      env: process.env,
-      stdio: 'inherit',
-    });
-    m.on('exit', (code) => {
-      if (code === 0) {
-        console.log('[dev-all] Migrations completed successfully.');
-        resolve();
-      } else {
-        reject(new Error(`Migration runner exited with code ${code}`));
-      }
-    });
-    m.on('error', reject);
-  });
-}
+services.forEach(start);
+setInterval(watchHealth, 5000);
 
 function shutdown() {
   shuttingDown = true;
@@ -98,24 +81,3 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-
-async function startStack() {
-  // Only execute migrations when invoked directly (npm run dev / node scripts/dev-all.js).
-  // When required by scripts/dev-stack.js (npm run dev:all), migrations were already executed.
-  const isDirectExecution = require.main === module;
-  const skipMigrate = process.env.SKIP_MIGRATE === '1';
-
-  if (isDirectExecution && !skipMigrate) {
-    try {
-      await runMigrations();
-    } catch (err) {
-      console.error(`[dev-all] FATAL: ${err.message}. Aborting service startup.`);
-      process.exit(1);
-    }
-  }
-
-  services.forEach(start);
-  setInterval(watchHealth, 5000);
-}
-
-startStack();

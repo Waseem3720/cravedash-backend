@@ -4,9 +4,9 @@
   "private": true,
   "description": "CraveDash PostgreSQL migrations and seeds",
   "scripts": {
-    "migrate": "node ../shared/scripts/migrate.js",
-    "seed:sql": "psql \"$DATABASE_URL\" -f seeds/001_seed.sql",
-    "seed": "node seeds/seed.js"
+    "migrate": "node -e \"console.error('BUG-031: migrations/001_init.sql is a different schema. Use the root npm run migrate (scripts/init-db.sql).'); process.exit(1)\"",
+    "seed:sql": "node -e \"console.error('BUG-031: seeds/001_seed.sql targets the retired schema. Use the root npm run seed.'); process.exit(1)\"",
+    "seed": "node -e \"console.error('BUG-031: database/seeds/seed.js targets the retired schema. Use the root npm run seed.'); process.exit(1)\""
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

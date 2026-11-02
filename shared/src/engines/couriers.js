@@ -53,7 +53,11 @@ async function stuartToken(keys) {
  * Dispatch a delivery job to Uber Direct or Stuart.
  * body: { provider, order_id, pickup, dropoff, manifest }
  */
-async function dispatch(pool, restaurantId, body) {
+/**
+ * Sends a delivery to the courier provider with the restaurant's integration keys (a shared integration). The job row
+ * belongs to the caller's branch when there is one, and to the restaurant (branch_id NULL) otherwise.
+ */
+async function dispatch(pool, restaurantId, body, branch = null) {
   const provider = String(body.provider || 'uber_direct');
   const integ = await getIntegration(pool, restaurantId, provider);
   if (!integ) {
@@ -110,6 +114,7 @@ async function dispatch(pool, restaurantId, body) {
   }
 
   const job = await appendRow(restaurantId, 'ops', 'courier_jobs', {
+    branch_id: branch || null,
     provider,
     order_id: body.order_id,
     external_id: external,
@@ -124,6 +129,12 @@ async function dispatch(pool, restaurantId, body) {
 async function ingestMarketplaceOrder(restaurantId, source, payload) {
   const orders = await readDoc(restaurantId, 'ops', 'marketplace_inbox', []);
   const arr = Array.isArray(orders) ? orders : [];
+  const externalId = payload.external_id || payload.id || payload.order_id || null;
+  // A re-delivered order (same source and external id) returns the existing row and is not inserted twice.
+  if (externalId) {
+    const existing = arr.find((o) => o && o.source === source && o.external_id === externalId);
+    if (existing) return { ...existing, duplicate: true };
+  }
   const row = {
     id: `mp_${source}_${Date.now().toString(36)}`,
     source,

@@ -22,8 +22,4 @@ function badRequest(message = 'Bad request') {
   return new AppError(message, 400, 'BAD_REQUEST');
 }
 
-function conflict(message = 'Conflict') {
-  return new AppError(message, 409, 'CONFLICT');
-}
-
-module.exports = { AppError, notFound, unauthorized, forbidden, badRequest, conflict };
+module.exports = { AppError, notFound, unauthorized, forbidden, badRequest };

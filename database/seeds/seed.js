@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 
-require('dotenv').config({ path: process.env.DOTENV_PATH || require('path').join(__dirname, '../../.env') });
+require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const { Client } = require('pg');
 const bcrypt = require('bcryptjs');
 
-if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_SEED !== '1') {
+// BUG-029: demo data is never loaded in production. No override exists (ALLOW_DEMO_SEED was removed).
+if (process.env.NODE_ENV === 'production') {
   console.error('[seed] Refusing to run in production (sets known demo passwords/PINs).');
-  console.error('[seed] For a controlled seed set ALLOW_DEMO_SEED=1 (never on a live customer DB).');
   process.exit(1);
 }
 
@@ -381,25 +381,7 @@ async function main() {
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
   const pinHash = async (pin) => bcrypt.hash(pin, 10);
 
-  const clientConfig = process.env.PGHOST
-    ? {
-        host: process.env.PGHOST,
-        port: +(process.env.PGPORT || 5432),
-        user: process.env.PGUSER || 'cravedash',
-        password: process.env.PGPASSWORD || 'cravedash',
-        database: process.env.PGDATABASE || 'cravedash',
-      }
-    : process.env.DATABASE_URL
-      ? { connectionString: DATABASE_URL }
-      : {
-          host: 'localhost',
-          port: +(process.env.PGPORT || 5432),
-          user: process.env.PGUSER || 'cravedash',
-          password: process.env.PGPASSWORD || 'cravedash',
-          database: process.env.PGDATABASE || 'cravedash',
-        };
-
-  const client = new Client(clientConfig);
+  const client = new Client({ connectionString: DATABASE_URL });
   await client.connect();
 
   try {
