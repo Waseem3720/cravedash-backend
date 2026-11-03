@@ -260,23 +260,21 @@ async function main() {
 
   // Kitchen (chef) account for the KDS app: email login, and a PIN for the kitchen tablet (PIN 5678).
   const chefPinHash = await bcrypt.hash('5678', 10);
-  const chefData = JSON.stringify({
+  const chefMetadata = JSON.stringify({
     pin_hash: chefPinHash,
     password_hash: hash,
   });
 
   await upsert(
-    `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, pin_hash, password_hash, data)
-     VALUES ('chef_01','r1','Marco Pierre','chef@portopiripiri.example','+447911123456', TRUE, $1, $2, $3::jsonb)
+    `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, metadata)
+     VALUES ('chef_01','r1','Marco Pierre','chef@portopiripiri.example','+447911123456', TRUE, $1::jsonb)
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        email = EXCLUDED.email,
        phone = EXCLUDED.phone,
        status = TRUE,
-       pin_hash = EXCLUDED.pin_hash,
-       password_hash = EXCLUDED.password_hash,
-       data = COALESCE(chefs.data, '{}'::jsonb) || EXCLUDED.data`,
-    [chefPinHash, hash, chefData],
+       metadata = COALESCE(chefs.metadata, '{}'::jsonb) || EXCLUDED.metadata`,
+    [chefMetadata],
   );
 
   await upsert(
@@ -287,7 +285,7 @@ async function main() {
   );
 
   // Rider account for the deliveryman app: email login (no role needed), status active.
-  const riderData = JSON.stringify({
+  const riderMetadata = JSON.stringify({
     reg: 'DEMO 01',
     zones: ['Glasgow South · G41', 'Shawlands · G43'],
     capacity: 3,
@@ -295,17 +293,16 @@ async function main() {
   });
 
   await upsert(
-    `INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, password_hash, data)
-     VALUES ('dm_1','r1','Alex Rider','07700 900123','rider@portopiripiri.co.uk','Car','active', $1, $2::jsonb)
+    `INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, metadata)
+     VALUES ('dm_1','r1','Alex Rider','07700 900123','rider@portopiripiri.co.uk','Car','active', $1::jsonb)
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        phone = EXCLUDED.phone,
        email = EXCLUDED.email,
        vehicle = EXCLUDED.vehicle,
        status = 'active',
-       password_hash = COALESCE(EXCLUDED.password_hash, deliverymen.password_hash),
-       data = COALESCE(deliverymen.data, '{}'::jsonb) || EXCLUDED.data`,
-    [hash, riderData],
+       metadata = COALESCE(deliverymen.metadata, '{}'::jsonb) || EXCLUDED.metadata`,
+    [riderMetadata],
   );
 
   await upsert(

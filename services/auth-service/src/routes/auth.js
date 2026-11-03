@@ -1213,12 +1213,12 @@ router.post('/staff/pin-login', asyncHandler(async (req, res) => {
   if (!pin || !/^\d{4,8}$/.test(String(pin))) throw badRequest('pin must be 4 to 8 digits');
   if (!restaurantId) throw badRequest('restaurant_id is required');
   const { rows: chefs } = await pool.query(
-    "SELECT id, pin_hash, data FROM chefs WHERE restaurant_id = $1 AND status = TRUE AND (pin_hash IS NOT NULL OR (data IS NOT NULL AND data ? 'pin_hash'))",
+    "SELECT id, metadata FROM chefs WHERE restaurant_id = $1 AND status = TRUE AND metadata IS NOT NULL AND metadata ? 'pin_hash'",
     [restaurantId],
   );
   let match = null;
   for (const chef of chefs) {
-    const hash = chef.pin_hash || chef.data?.pin_hash;
+    const hash = chef.metadata && chef.metadata.pin_hash;
     if (hash && (await bcrypt.compare(String(pin), String(hash)))) {
       match = chef;
       break;
