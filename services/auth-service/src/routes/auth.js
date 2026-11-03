@@ -40,8 +40,8 @@ const loginLimiter = createRateLimiter({
  * Staff login roles and the table that holds their record. users.id equals that row's id, so a login
  * stays linked to the chef or deliveryman it was created for.
  */
-const STAFF_TABLES = { chef: 'chefs', driver: 'deliverymen' };
-const ACCOUNT_ROLES = ['super', 'restaurant', 'epos', ...Object.keys(STAFF_TABLES)];
+const STAFF_TABLES = { chef: 'chefs', driver: 'deliverymen', rider: 'deliverymen' };
+const ACCOUNT_ROLES = ['super', 'restaurant', 'epos', 'rider', ...Object.keys(STAFF_TABLES)];
 
 /** A chef or driver can sign in only while their record is active. Status is edited on the staff page. */
 async function staffIsActive(user) {
@@ -103,23 +103,24 @@ function clearSessionCookies(res) {
 router.post('/login', loginLimiter, asyncHandler(async (req, res) => {
   const { email, password, role: requestedRole, scope } = req.body || {};
   if (!email || !password) throw badRequest('email and password are required');
-  // Riders (deliveryman app) may send role "rider" or no role at all. Their accounts are stored with role "driver".
-  let role = requestedRole === 'rider' ? 'driver' : requestedRole;
+  // Riders (deliveryman app) may send role "rider", "driver", or no role at all. Their accounts in DB have role "rider".
+  const isRiderLookup = requestedRole === 'rider' || requestedRole === 'driver';
+  let role = requestedRole;
   if (!role) {
     const { rows: couriers } = await pool.query(
-      "SELECT 1 FROM users WHERE LOWER(email) = LOWER($1) AND role = 'driver' AND status = TRUE LIMIT 1",
+      "SELECT role FROM users WHERE LOWER(email) = LOWER($1) AND role IN ('rider', 'driver') AND status = TRUE LIMIT 1",
       [email],
     );
     if (!couriers[0]) throw badRequest('role is required');
-    role = 'driver';
+    role = couriers[0].role;
   }
   if (!ACCOUNT_ROLES.includes(role)) throw badRequest('Invalid role');
   // scope: 'branch' (Branch login link) or 'restaurant' (Restaurant login link). Each link only signs in its own accounts.
   if (scope !== undefined && scope !== 'branch' && scope !== 'restaurant') throw badRequest('Invalid scope');
 
   const { rows } = await pool.query(
-    'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND role = $2 AND status = TRUE LIMIT 1',
-    [email, role],
+    'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND (role = $2 OR ($3 = TRUE AND role IN (\'rider\', \'driver\'))) AND status = TRUE LIMIT 1',
+    [email, role, isRiderLookup],
   );
   const user = rows[0];
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
@@ -151,10 +152,13 @@ router.post('/login', loginLimiter, asyncHandler(async (req, res) => {
 
   await pool.query('UPDATE users SET last_login = NOW(), updated_at = NOW() WHERE id = $1', [user.id]);
 
+  // Delivery rider accounts use role 'driver' in session tokens for the deliveryman app
+  const sessionRole = (user.role === 'rider' || isRiderLookup) ? 'driver' : user.role;
+
   const token = sign({
     sub: user.id,
     email: user.email,
-    role: user.role,
+    role: sessionRole,
     name: user.name,
     restaurant_id: user.restaurant_id,
     till_id: user.till_id,
@@ -169,7 +173,7 @@ router.post('/login', loginLimiter, asyncHandler(async (req, res) => {
     user: {
       id: user.id,
       email: user.email,
-      role: user.role,
+      role: sessionRole,
       name: user.name,
       restaurant_id: user.restaurant_id,
       till_id: user.till_id,
@@ -1063,7 +1067,7 @@ router.post('/oauth/:provider', createRateLimiter({ windowMs: 15 * 60 * 1000, ma
       // debug_token confirms the token is valid and was issued to this app (SEC-M1).
       const dbg = await fetch(
         `https://graph.facebook.com/debug_token?input_token=${encodeURIComponent(access_token)}`
-          + `&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`,
+        + `&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`,
       );
       const dbgBody = await dbg.json().catch(() => ({}));
       const info = (dbgBody && dbgBody.data) || {};
@@ -1209,12 +1213,13 @@ router.post('/staff/pin-login', asyncHandler(async (req, res) => {
   if (!pin || !/^\d{4,8}$/.test(String(pin))) throw badRequest('pin must be 4 to 8 digits');
   if (!restaurantId) throw badRequest('restaurant_id is required');
   const { rows: chefs } = await pool.query(
-    "SELECT id, metadata FROM chefs WHERE restaurant_id = $1 AND status = TRUE AND metadata ? 'pin_hash'",
+    "SELECT id, pin_hash, data FROM chefs WHERE restaurant_id = $1 AND status = TRUE AND (pin_hash IS NOT NULL OR (data IS NOT NULL AND data ? 'pin_hash'))",
     [restaurantId],
   );
   let match = null;
   for (const chef of chefs) {
-    if (await bcrypt.compare(String(pin), String(chef.metadata.pin_hash))) {
+    const hash = chef.pin_hash || chef.data?.pin_hash;
+    if (hash && (await bcrypt.compare(String(pin), String(hash)))) {
       match = chef;
       break;
     }

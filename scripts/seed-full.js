@@ -1,3 +1,4 @@
+
 /**
  * Seed demo users (demo12345) + Porto Piri Piri catalogue into scripts/init-db schema.
  */
@@ -10,35 +11,71 @@ const pool = require('../shared/src/db');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 /**
- * BUG-029 / BUG-030: demo data (known passwords and PINs) is for a local development database only. There is no override.
- * The target is refused unless it is verifiably local and the environment is not production.
+ * Demo credentials are allowed only for an explicitly authorized seed run.
+ * Database target resolution follows shared/src/db.js:
+ * PGHOST takes precedence over DATABASE_URL.
+ *
+ * Local development can run without an override. Remote/production seeding
+ * requires ALLOW_DEMO_SEED=1 and is restricted to the expected cravedash DB.
  */
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-function seedTargetHost() {
-  if (process.env.DATABASE_URL) {
-    try {
-      return new URL(process.env.DATABASE_URL).hostname;
-    } catch {
-      return null; // unreadable URL: the target cannot be verified
-    }
+
+function seedTarget() {
+  if (process.env.PGHOST) {
+    return {
+      host: process.env.PGHOST,
+      database: process.env.PGDATABASE || 'cravedash',
+      user: process.env.PGUSER || 'cravedash',
+    };
   }
-  return process.env.PGHOST || 'localhost';
+
+  const connectionString =
+    process.env.DATABASE_URL ||
+    'postgres://cravedash:cravedash@localhost:5432/cravedash';
+
+  try {
+    const url = new URL(connectionString);
+    return {
+      host: url.hostname,
+      database: decodeURIComponent(url.pathname.replace(/^\/+/, '')),
+      user: decodeURIComponent(url.username),
+    };
+  } catch {
+    return null;
+  }
 }
-function assertLocalSeedTarget() {
-  if (process.env.NODE_ENV === 'production') {
-    console.error('[seed-full] Refusing to run: NODE_ENV is production. Demo data is never loaded into production.');
+
+function assertSeedTarget() {
+  const target = seedTarget();
+
+  if (!target || !target.host || !target.database) {
+    console.error('[seed-full] Refusing to run: database target cannot be verified.');
     process.exit(1);
   }
-  const host = seedTargetHost();
-  if (!host || !LOCAL_HOSTS.has(host.toLowerCase())) {
-    console.error('[seed-full] Refusing to run: the database host is not verifiably local (localhost, 127.0.0.1 or ::1).');
+
+  const isLocal = LOCAL_HOSTS.has(target.host.toLowerCase());
+  const explicitlyAuthorized = process.env.ALLOW_DEMO_SEED === '1';
+
+  if (target.database !== 'cravedash') {
+    console.error('[seed-full] Refusing to run: expected database "cravedash".');
     process.exit(1);
   }
+
+  if ((process.env.NODE_ENV === 'production' || !isLocal) && !explicitlyAuthorized) {
+    console.error(
+      '[seed-full] Refusing to run: production/remote seeding requires ALLOW_DEMO_SEED=1.',
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `[seed-full] Authorized target: ${target.host}/${target.database} (${isLocal ? 'local' : 'remote'})`,
+  );
 }
-assertLocalSeedTarget();
+
+assertSeedTarget();
 
 const DEMO_PASSWORD = 'demo12345';
-const HASH = null; // filled at runtime
 
 function loadPortoSeed() {
   const candidates = [
@@ -72,73 +109,75 @@ function defaultModules(planId, isR1 = false) {
   };
 }
 
+/**
+ * Platform defaults only.
+ * Payment credentials, card details, balances, and payout flags are excluded.
+ * Existing payment-related fields remain untouched in restaurants.data.
+ */
 function restaurantDataJson(planId, subStatus, opts = {}) {
   const now = new Date();
   const next = new Date(now);
   next.setDate(next.getDate() + 30);
   const expires = new Date(now);
   expires.setDate(expires.getDate() + (opts.expiresDays ?? 23));
-  const auto = subStatus === 'active' || subStatus === 'past_due';
-  const pay_api =
-    opts.pay_api !== undefined
-      ? opts.pay_api
-      : auto
-        ? {
-            provider: 'stripe',
-            mode: 'test',
-            account_id: opts.stripe_account || 'acct_1QPORTODEMO',
-            pk: 'pk_test_51QdemoPublishable',
-            sk: 'rk_test_51QdemoRestricted',
-            connected_at: opts.joined_at || now.toISOString(),
-          }
-        : null;
 
   return {
     modules: defaultModules(planId, opts.id === 'r1'),
-    access_level: subStatus === 'past_due' ? 'restricted' : subStatus === 'suspended' ? 'suspended' : 'full',
-    auto_deduct: !!auto && !!pay_api,
-    next_charge: (opts.next_charge || next).toISOString?.() || opts.next_charge || next.toISOString(),
-    api_key: opts.api_key || `cd_live_${Math.random().toString(36).slice(2, 14)}${Math.random().toString(36).slice(2, 14)}`,
+    access_level:
+      subStatus === 'past_due'
+        ? 'restricted'
+        : subStatus === 'suspended'
+          ? 'suspended'
+          : 'full',
+    next_charge:
+      (opts.next_charge || next).toISOString?.() ||
+      opts.next_charge ||
+      next.toISOString(),
+    api_key:
+      opts.api_key ||
+      `cd_live_${Math.random().toString(36).slice(2, 14)}${Math.random().toString(36).slice(2, 14)}`,
     api_key_status: true,
     billing_cycle: 'monthly',
     expires_at: expires.toISOString(),
     branches: opts.branches ?? (opts.id === 'r1' ? 1 : 0),
     max_branches: opts.max_branches ?? 10,
-    pay_api,
     joined_at: opts.joined_at || now.toISOString(),
-    card_brand: opts.card_brand || 'Visa',
-    card_last4: opts.card_last4 || '4242',
-    stripe_account: opts.stripe_account || 'acct_1QPORTODEMO',
-    charges_enabled: subStatus === 'active',
-    payouts_enabled: subStatus === 'active',
-    stripe_balance: subStatus === 'active' ? 1200 : 0,
-    monthly_gmv: subStatus === 'active' ? 8500 : 0,
     timezone: 'Europe/London',
     currency: 'GBP',
   };
 }
 
 async function seedRestaurantPlatformData() {
-  console.log('Seeding restaurant platform data (modules, access, pay_api)…');
-  const { rows } = await pool.query('SELECT id, plan_id, sub_status, data FROM restaurants');
+  console.log('Seeding restaurant platform data (modules and access)…');
+
+  const { rows } = await pool.query(
+    'SELECT id, plan_id, sub_status, data FROM restaurants',
+  );
+
   for (const row of rows) {
-    const existing = row.data && typeof row.data === 'object' ? row.data : {};
+    const existing =
+      row.data && typeof row.data === 'object' ? row.data : {};
+
+    const defaults = restaurantDataJson(row.plan_id, row.sub_status, {
+      id: row.id,
+      joined_at: existing.joined_at,
+      api_key: existing.api_key,
+    });
+
     const merged = {
-      ...restaurantDataJson(row.plan_id, row.sub_status, {
-        id: row.id,
-        joined_at: existing.joined_at,
-        pay_api: row.id === 'r1' ? restaurantDataJson(row.plan_id, 'active', { id: 'r1' }).pay_api : existing.pay_api,
-      }),
+      ...defaults,
       ...existing,
-      modules: { ...defaultModules(row.plan_id, row.id === 'r1'), ...(existing.modules || {}) },
+      modules: {
+        ...defaultModules(row.plan_id, row.id === 'r1'),
+        ...(existing.modules || {}),
+      },
     };
-    if (row.id === 'r1') {
-      merged.pay_api = restaurantDataJson('plan_starter', 'active', { id: 'r1' }).pay_api;
-      merged.auto_deduct = true;
-      merged.card_last4 = '4242';
-      merged.card_brand = 'Visa';
-    }
-    await upsert(`UPDATE restaurants SET data = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(merged)]);
+
+    // Payment-related fields are not generated or overwritten.
+    await upsert(
+      'UPDATE restaurants SET data = $2::jsonb WHERE id = $1',
+      [row.id, JSON.stringify(merged)],
+    );
   }
 }
 
@@ -150,6 +189,7 @@ async function main() {
   const pin4567 = await bcrypt.hash('4567', 10);
 
   console.log('Seeding extra plans + restaurants…');
+
   for (const [id, name, price] of [
     ['plan_pro', 'Professional Plan', 79.99],
     ['plan_enterprise', 'Enterprise Plan', 199.99],
@@ -162,6 +202,7 @@ async function main() {
       [id, name, price, Math.round(price * 10 * 100) / 100],
     );
   }
+
   const extraRestaurants = [
     ['r12', 12, 'Shotts Tandoori', 'Waseem', 'plan_enterprise', 'active'],
     ['r6', 6, 'ZEE GRILL', 'Zahid Mehmood', 'plan_enterprise', 'past_due'],
@@ -170,17 +211,30 @@ async function main() {
     ['r15', 15, 'DEMO', 'Waseem', 'plan_basix', 'canceled'],
     ['r16', 16, 'Charsi Tikka', 'Tahir Khan', 'plan_starter', 'inactive'],
   ];
+
   for (const [id, liveId, name, owner, plan, st] of extraRestaurants) {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
     await upsert(
       `INSERT INTO restaurants (id, live_id, name, owner, email, phone, address, city, plan_id, sub_status, status, data)
        VALUES ($1,$2,$3,$4,$5,$6,'',$7,$8,$9,TRUE,'{}'::jsonb)
        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, plan_id = EXCLUDED.plan_id, sub_status = EXCLUDED.sub_status`,
-      [id, liveId, name, owner, `owner@${slug}.example`, '0141 000 0000', 'United Kingdom', plan, st],
+      [
+        id,
+        liveId,
+        name,
+        owner,
+        `owner@${slug}.example`,
+        '0141 000 0000',
+        'United Kingdom',
+        plan,
+        st,
+      ],
     );
   }
 
   console.log('Seeding users…');
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id, till_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -188,6 +242,7 @@ async function main() {
        name = EXCLUDED.name, restaurant_id = EXCLUDED.restaurant_id, till_id = EXCLUDED.till_id, status = TRUE`,
     ['u_super', 'owner@cravedash.co.uk', hash, 'super', 'Platform Owner', null, null],
   );
+
   // Owner-level platform admin row (BUG-001): development seed only, never created by scripts/init-db.sql.
   await upsert(
     `INSERT INTO platform_admins (id, name, email, phone, role, status, perms)
@@ -195,51 +250,86 @@ async function main() {
      ON CONFLICT (id) DO NOTHING`,
     [],
   );
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
      VALUES ($1,$2,$3,'restaurant',$4,'r1')
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, name = EXCLUDED.name, restaurant_id = 'r1', role = 'restaurant'`,
     ['u_owner', 'owner@portopiripiri.example', hash, 'Faisal'],
   );
+
   // Kitchen (chef) account for the KDS app: email login, and a PIN for the kitchen tablet (PIN 5678).
+  const chefPinHash = await bcrypt.hash('5678', 10);
+  const chefData = JSON.stringify({
+    pin_hash: chefPinHash,
+    password_hash: hash,
+  });
+
   await upsert(
-    `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, metadata)
-     VALUES ('chef_01','r1','Marco Pierre','chef@portopiripiri.example','+447911123456', TRUE, $1::jsonb)
-     ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata, status = TRUE`,
-    [JSON.stringify({ pin_hash: await bcrypt.hash('5678', 10) })],
+    `INSERT INTO chefs (id, restaurant_id, name, email, phone, status, pin_hash, password_hash, data)
+     VALUES ('chef_01','r1','Marco Pierre','chef@portopiripiri.example','+447911123456', TRUE, $1, $2, $3::jsonb)
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       email = EXCLUDED.email,
+       phone = EXCLUDED.phone,
+       status = TRUE,
+       pin_hash = EXCLUDED.pin_hash,
+       password_hash = EXCLUDED.password_hash,
+       data = COALESCE(chefs.data, '{}'::jsonb) || EXCLUDED.data`,
+    [chefPinHash, hash, chefData],
   );
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
      VALUES ('chef_01','chef@portopiripiri.example',$1,'chef','Marco Pierre','r1')
-     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'chef', restaurant_id = 'r1', status = TRUE`,
+     ON CONFLICT (email) DO UPDATE SET id = EXCLUDED.id, password_hash = EXCLUDED.password_hash, role = 'chef', name = EXCLUDED.name, restaurant_id = 'r1', status = TRUE`,
     [hash],
   );
+
   // Rider account for the deliveryman app: email login (no role needed), status active.
+  const riderData = JSON.stringify({
+    reg: 'DEMO 01',
+    zones: ['Glasgow South · G41', 'Shawlands · G43'],
+    capacity: 3,
+    password_hash: hash,
+  });
+
   await upsert(
-    `INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, metadata)
-     VALUES ('dm_1','r1','Alex Rider','07700 900123','rider@portopiripiri.co.uk','Car','active', $1::jsonb)
-     ON CONFLICT (id) DO UPDATE SET status = 'active', metadata = EXCLUDED.metadata`,
-    [JSON.stringify({ reg: 'DEMO 01', zones: ['Glasgow South · G41', 'Shawlands · G43'], capacity: 3 })],
+    `INSERT INTO deliverymen (id, restaurant_id, name, phone, email, vehicle, status, password_hash, data)
+     VALUES ('dm_1','r1','Alex Rider','07700 900123','rider@portopiripiri.co.uk','Car','active', $1, $2::jsonb)
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       phone = EXCLUDED.phone,
+       email = EXCLUDED.email,
+       vehicle = EXCLUDED.vehicle,
+       status = 'active',
+       password_hash = COALESCE(EXCLUDED.password_hash, deliverymen.password_hash),
+       data = COALESCE(deliverymen.data, '{}'::jsonb) || EXCLUDED.data`,
+    [hash, riderData],
   );
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
-     VALUES ('dm_1','rider@portopiripiri.co.uk',$1,'driver','Alex Rider','r1')
-     ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'driver', restaurant_id = 'r1', status = TRUE`,
+     VALUES ('dm_1','rider@portopiripiri.co.uk',$1,'rider','Alex Rider','r1')
+     ON CONFLICT (email) DO UPDATE SET id = EXCLUDED.id, password_hash = EXCLUDED.password_hash, role = 'rider', name = EXCLUDED.name, restaurant_id = 'r1', status = TRUE`,
     [hash],
   );
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id, till_id)
      VALUES ($1,$2,$3,'epos',$4,'r1','till-1')
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'epos', till_id = 'till-1'`,
     ['u_epos', 'till1@portopiripiri.example', hash, 'Till 1'],
   );
-  // Keep legacy emails working
+
+  // Keep legacy emails working.
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
      VALUES ($1,$2,$3,'super',$4,NULL)
      ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
     ['u_super_legacy', 'admin@cravedash.co.uk', hash, 'Master Admin'],
   );
+
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id, till_id)
      VALUES ($1,$2,$3,'epos',$4,'r1','till-1')
@@ -248,12 +338,14 @@ async function main() {
   );
 
   console.log('Seeding till staff PINs…');
+
   const staff = [
     ['ts1', 'Alex Khan', pinHash, 'manager'],
     ['ts2', 'Sarah Johnson', pin2345, 'supervisor'],
     ['ts3', 'Maria Clarke', pin3456, 'cashier'],
     ['ts4', 'Omar Ali', pin4567, 'cashier'],
   ];
+
   for (const [id, name, ph, role] of staff) {
     await upsert(
       `INSERT INTO till_staff (id, restaurant_id, name, pin_hash, role, till_id)
@@ -264,12 +356,15 @@ async function main() {
   }
 
   const porto = loadPortoSeed();
+
   if (!porto) {
     console.warn('PORTO_SEED not found — skipping catalogue');
   } else {
     console.log('Seeding Porto catalogue…');
+
     const colour = '#0b84f3';
     const text = '#ffffff';
+
     const cats = porto.categories.map((c, i) => ({
       id: `cat${i + 1}`,
       num: i + 1,
@@ -279,6 +374,7 @@ async function main() {
       text_colour: text,
       priority: i + 1,
     }));
+
     for (const c of cats) {
       await upsert(
         `INSERT INTO categories (id, restaurant_id, num, name, image, colour, text_colour, priority, status)
@@ -292,6 +388,7 @@ async function main() {
       const parent = cats.find((c) => c.name === s[0]) || cats[0];
       return { id: `sub${i + 1}`, parent_id: parent.id, name: s[1] };
     });
+
     for (const s of subs) {
       await upsert(
         `INSERT INTO subcategories (id, restaurant_id, parent_id, name, status)
@@ -305,6 +402,7 @@ async function main() {
       const id = typeof a === 'string' ? `ad_${a.replace(/\W+/g, '_').slice(0, 40)}` : a.id;
       const name = typeof a === 'string' ? a : a.name;
       const price = typeof a === 'object' ? Number(a.price || 0) : 0.6;
+
       await upsert(
         `INSERT INTO addons (id, restaurant_id, name, price, status)
          VALUES ($1,'r1',$2,$3,TRUE)
@@ -323,9 +421,11 @@ async function main() {
     }
 
     let n = 0;
+
     for (const p of porto.products || []) {
       const cat = cats.find((c) => c.name === p.category) || cats[0];
       const price = Number(p.price || 0);
+
       const data = {
         live_id: p.live_id,
         description: p.description || '',
@@ -335,6 +435,7 @@ async function main() {
         veg: !!p.veg,
         product_type: p.veg ? 'veg' : 'nonveg',
       };
+
       await upsert(
         `INSERT INTO products (id, restaurant_id, name, category_id, price, from_price, data, status, visible, description)
          VALUES ($1,'r1',$2,$3,$4,$5,$6::jsonb,TRUE,TRUE,$7)
@@ -342,12 +443,14 @@ async function main() {
            price = EXCLUDED.price, from_price = EXCLUDED.from_price, data = EXCLUDED.data, description = EXCLUDED.description`,
         [p.id, p.name, cat.id, price, price, JSON.stringify(data), p.description || ''],
       );
+
       n++;
     }
+
     console.log(`  ${cats.length} categories, ${n} products`);
   }
 
-  // Floor tables
+  // Floor tables.
   const tables = [
     [1, 'area1', 'square', 2, 1, 1], [2, 'area1', 'square', 2, 3, 1], [3, 'area1', 'round', 4, 5, 1],
     [4, 'area1', 'rect', 6, 7, 1], [5, 'area1', 'round', 4, 1, 3], [6, 'area1', 'rect', 6, 3, 3],
@@ -356,12 +459,20 @@ async function main() {
     [11, 'area2', 'square', 4, 5, 1], [12, 'area2', 'rect', 6, 2, 3],
     [13, 'area3', 'square', 2, 1, 1], [14, 'area3', 'square', 2, 1, 3], [15, 'area3', 'square', 2, 1, 5],
   ];
-  for (const [areaId, name] of [['area1', 'Main Hall'], ['area2', 'Patio'], ['area3', 'Window']]) {
+
+  for (const [areaId, name] of [
+    ['area1', 'Main Hall'],
+    ['area2', 'Patio'],
+    ['area3', 'Window'],
+  ]) {
     await upsert(
-      `INSERT INTO areas (id, restaurant_id, name) VALUES ($1,'r1',$2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+      `INSERT INTO areas (id, restaurant_id, name)
+       VALUES ($1,'r1',$2)
+       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
       [areaId, name],
     );
   }
+
   for (const t of tables) {
     await upsert(
       `INSERT INTO dining_tables (id, restaurant_id, number, area_id, shape, seats, pos_x, pos_y, active)
@@ -379,10 +490,19 @@ async function main() {
   console.log('  Restaurant: owner@portopiripiri.example');
   console.log('  EPOS: till1@portopiripiri.example');
   console.log('  Till PINs: 1234 / 2345 / 3456 / 4567');
+  console.log('  Chef tablet PIN: 5678');
+
   await pool.end();
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(e);
+
+  try {
+    await pool.end();
+  } catch (closeError) {
+    console.error('[seed-full] Failed to close database pool:', closeError);
+  }
+
   process.exit(1);
 });
