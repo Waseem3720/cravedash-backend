@@ -307,8 +307,8 @@ async function main() {
 
   await upsert(
     `INSERT INTO users (id, email, password_hash, role, name, restaurant_id)
-     VALUES ('dm_1','rider@portopiripiri.co.uk',$1,'rider','Alex Rider','r1')
-     ON CONFLICT (email) DO UPDATE SET id = EXCLUDED.id, password_hash = EXCLUDED.password_hash, role = 'rider', name = EXCLUDED.name, restaurant_id = 'r1', status = TRUE`,
+     VALUES ('dm_1','rider@portopiripiri.co.uk',$1,'driver','Alex Rider','r1')
+     ON CONFLICT (email) DO UPDATE SET id = EXCLUDED.id, password_hash = EXCLUDED.password_hash, role = 'driver', name = EXCLUDED.name, restaurant_id = 'r1', status = TRUE`,
     [hash],
   );
 
