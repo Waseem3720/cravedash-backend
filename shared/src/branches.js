@@ -11,7 +11,7 @@ async function restaurantBranches(db, restaurant) {
   const fromPanel = Array.isArray(docRows[0]?.data) ? docRows[0].data : [];
   const byId = new Map();
   for (const b of [...fromRestaurant, ...fromPanel]) {
-    if (b && b.id !== undefined && b.id !== null && String(b.id) !== '') byId.set(String(b.id), { id: String(b.id), name: b.name || String(b.id) });
+    if (b && b.id !== undefined && b.id !== null && String(b.id) !== '') byId.set(String(b.id), { ...b, id: String(b.id), name: b.name || String(b.id) });
   }
   return [...byId.values()];
 }

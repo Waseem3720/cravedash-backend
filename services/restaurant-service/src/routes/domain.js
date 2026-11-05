@@ -14,6 +14,7 @@ const asyncHandler = require('@cravedash/shared/src/asyncHandler');
 const { restaurantId, branchId } = require('@cravedash/shared/src/authMiddleware');
 const { badRequest, forbidden, AppError } = require('@cravedash/shared/src/errors');
 const { branchServiceGate } = require('@cravedash/shared/src/branchServiceGuard');
+const { restaurantBranches } = require('@cravedash/shared/src/branches');
 
 const router = express.Router();
 
@@ -440,7 +441,15 @@ function sendDoc(res, doc, append) {
 router.get('/domain/:domain/:collection', asyncHandler(async (req, res) => {
   const { domain, collection } = assertDomainCollection(req.params.domain, req.params.collection);
   assertCanRead(req, domain);
-  const doc = await readScopedDoc(rid(req), domain, collection, branchId(req) || null);
+  const bound = branchId(req) || null;
+  if (domain === 'ops' && collection === 'branches') {
+    let branches = await restaurantBranches(pool, rid(req));
+    if (bound) {
+      branches = branches.filter((b) => String(b.id) === String(bound));
+    }
+    return sendDoc(res, { data: branches, version: 0 }, false);
+  }
+  const doc = await readScopedDoc(rid(req), domain, collection, bound);
   if (Array.isArray(doc.data)) doc.data = courierScope(collection, req, doc.data);
   sendDoc(res, doc, APPEND_ONLY.has(collection));
 }));

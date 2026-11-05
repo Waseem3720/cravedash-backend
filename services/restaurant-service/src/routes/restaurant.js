@@ -7,6 +7,7 @@ const asyncHandler = require('@cravedash/shared/src/asyncHandler');
 const { restaurantId, branchId, assertBranchAccess, branchScopeFilter, rowInBranchScope } = require('@cravedash/shared/src/authMiddleware');
 const { notFound, forbidden, badRequest, unauthorized, AppError } = require('@cravedash/shared/src/errors');
 const { requireBranchService } = require('@cravedash/shared/src/branchServiceGuard');
+const { restaurantBranches, isRestaurantBranch } = require('@cravedash/shared/src/branches');
 const { cashByRider } = require('./riderCash');
 
 const router = express.Router();
@@ -88,6 +89,15 @@ function packExtras(body, opts, existing = null) {
   return body;
 }
 
+async function resolveCandidateBranch(restaurant, candidate, isSuper) {
+  if (!candidate || candidate === 'main') return null;
+  const str = String(candidate);
+  const branches = await restaurantBranches(pool, restaurant);
+  const match = branches.find((b) => String(b.id) === str || String(b.name || '').toLowerCase() === str.toLowerCase());
+  if (!match && !isSuper) throw badRequest('Invalid branch for this restaurant');
+  return match ? String(match.id) : str;
+}
+
 function mount(path, table, opts = {}) {
   const crud = buildCrud(pool, table, {
     restaurantColumn: 'restaurant_id',
@@ -133,10 +143,10 @@ function mount(path, table, opts = {}) {
       const bound = branchId(req);
       if (bound) {
         body.branch_id = bound; // cannot invent another branch
-      } else if (req.user?.role !== 'super') {
-        body.branch_id = null; // the owner's rows are restaurant-level
-      } else if (body.branch_id) {
-        assertBranchAccess(req, body.branch_id, { allowShared: true });
+      } else if (body.branch_id !== undefined && body.branch_id !== null && body.branch_id !== '') {
+        body.branch_id = await resolveCandidateBranch(r, body.branch_id, req.user?.role === 'super');
+      } else {
+        body.branch_id = null; // the owner's default is restaurant-level
       }
     }
     await assertTenantRefs(pool, r, body, foreignKeys);
@@ -150,7 +160,14 @@ function mount(path, table, opts = {}) {
     if (opts.branchScope) assertBranchAccess(req, existing.branch_id, { allowShared: !opts.branchOnly });
     await assertMutable(existing);
     const body = packExtras({ ...req.body }, opts, existing);
-    if (opts.branchScope && req.user?.role !== 'super') delete body.branch_id; // cannot reassign out of scope
+    if (opts.branchScope) {
+      const bound = branchId(req);
+      if (bound) {
+        delete body.branch_id; // cannot reassign out of scope
+      } else if (body.branch_id !== undefined) {
+        body.branch_id = await resolveCandidateBranch(r, body.branch_id, req.user?.role === 'super');
+      }
+    }
     await assertTenantRefs(pool, r, body, foreignKeys);
     ok(res, await crud.update(req.params.id, body, r));
   }));
@@ -162,7 +179,14 @@ function mount(path, table, opts = {}) {
     if (opts.branchScope) assertBranchAccess(req, existing.branch_id, { allowShared: !opts.branchOnly });
     await assertMutable(existing);
     const body = packExtras({ ...req.body }, opts, existing);
-    if (opts.branchScope && req.user?.role !== 'super') delete body.branch_id;
+    if (opts.branchScope) {
+      const bound = branchId(req);
+      if (bound) {
+        delete body.branch_id;
+      } else if (body.branch_id !== undefined) {
+        body.branch_id = await resolveCandidateBranch(r, body.branch_id, req.user?.role === 'super');
+      }
+    }
     await assertTenantRefs(pool, r, body, foreignKeys);
     ok(res, await crud.update(req.params.id, body, r));
   }));
@@ -608,7 +632,7 @@ router.patch('/restaurant/branches/:branchId/services', asyncHandler(async (req,
     await client.query('COMMIT');
     ok(res, nextBranches[index]);
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client.query('ROLLBACK').catch(() => { });
     throw err;
   } finally {
     client.release();
