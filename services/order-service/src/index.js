@@ -20,7 +20,7 @@ const PORT = +(process.env.PORT || 4003);
 const HOST = listenHost();
 
 // A kitchen (chef) session may read orders and run the kitchen actions only (cheff.md). Everything else stays admin/till.
-const KITCHEN_ACTIONS = /^\/[^/]+\/(accept|reject|ready|complete|print|dispatch)\/?$/;
+const KITCHEN_ACTIONS = /^\/[^/]+\/(accept|reject|ready|complete|print|dispatch|status)\/?$/;
 function chefOrderGuard(req, res, next) {
   if (req.user?.role !== 'chef') return next();
   if (req.method === 'GET' || KITCHEN_ACTIONS.test(req.path)) return next();
