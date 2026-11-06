@@ -91,6 +91,83 @@ function assertRiderForDispatch(order, status) {
   if (!d.delivery_man_id) throw badRequest('Assign a delivery man before sending this order out for delivery');
 }
 
+/** Enforces role-based boundaries on who can execute which order lifecycle transition. */
+function assertRoleAllowedTransition(req, order, nextStatus) {
+  const role = req.user?.role;
+  // Super admin and restaurant manager have full supervisory access.
+  if (role === 'super' || role === 'restaurant') return;
+
+  if (role === 'epos') {
+    // 1. Pending: POS accepts (-> processing) or rejects (-> canceled)
+    if (order.status === 'pending') {
+      if (!['processing', 'canceled'].includes(nextStatus)) {
+        throw forbidden('EPOS can only accept (processing) or reject (canceled) a pending order');
+      }
+      return;
+    }
+    // 2. Kitchen preparation stages: Chef's responsibility
+    if (['processing', 'confirmed', 'cooking'].includes(order.status)) {
+      throw forbidden('Only kitchen staff (Chef) can manage orders during kitchen preparation');
+    }
+    // 3. Ready for serve: delivery orders must be dispatched/picked up by rider
+    if (order.status === 'ready_for_serve') {
+      if (order.order_type === 'delivery') {
+        throw forbidden('Delivery orders must be delivered by the rider before completion');
+      }
+      if (!['completed', 'canceled'].includes(nextStatus)) {
+        throw forbidden('POS can only complete or cancel ready takeaway/dine-in orders');
+      }
+      return;
+    }
+    // 4. Out for delivery: POS has no button while rider is on the road
+    if (order.status === 'out_for_delivery') {
+      throw forbidden('Orders out for delivery must be completed by the rider');
+    }
+    // 5. Delivered: POS marks complete
+    if (order.status === 'delivered') {
+      if (!['completed', 'returned'].includes(nextStatus)) {
+        throw forbidden('POS can only complete or record return for delivered orders');
+      }
+      return;
+    }
+    // 6. Failed to deliver: POS resolves/cancels
+    if (order.status === 'failed_to_deliver') {
+      if (!['canceled', 'completed', 'ready_for_serve'].includes(nextStatus)) {
+        throw forbidden('POS can only cancel or complete failed delivery orders');
+      }
+      return;
+    }
+  }
+
+  if (role === 'chef') {
+    if (order.status === 'pending') {
+      throw forbidden('Only POS or restaurant management can accept pending orders');
+    }
+    if (!['processing', 'confirmed', 'cooking'].includes(order.status)) {
+      throw forbidden('Chef can only manage orders in kitchen stages');
+    }
+    if (!['confirmed', 'cooking', 'ready_for_serve', 'canceled'].includes(nextStatus)) {
+      throw forbidden('Chef can only move orders through preparation stages or cancel');
+    }
+  }
+
+  if (role === 'driver' || role === 'rider') {
+    if (order.status === 'ready_for_serve') {
+      if (nextStatus !== 'out_for_delivery') {
+        throw forbidden('Rider can only take ready orders out for delivery');
+      }
+      return;
+    }
+    if (order.status === 'out_for_delivery') {
+      if (!['delivered', 'failed_to_deliver'].includes(nextStatus)) {
+        throw forbidden('Rider can only mark an on-the-road order as delivered or failed');
+      }
+      return;
+    }
+    throw forbidden('Rider can only manage assigned orders in transit');
+  }
+}
+
 function mergeClientData(stored, incoming) {
   const keep = {};
   const storedData = stored && typeof stored === 'object' ? stored : {};
@@ -102,8 +179,8 @@ function mergeClientData(stored, incoming) {
 
 /** Kitchen display stages (cheff.md) and the fulfilment sources they can be filtered by. */
 const KITCHEN_STAGES = {
-  newOrder: ['pending', 'confirmed'],
-  preparing: ['cooking', 'processing'],
+  newOrder: ['processing', 'pending'],
+  preparing: ['confirmed', 'cooking'],
   ready: ['ready_for_serve'],
 };
 const KITCHEN_SOURCES = {
@@ -115,17 +192,17 @@ const KITCHEN_SOURCES = {
 };
 
 const TRANSITIONS = {
-  pending: ['confirmed', 'canceled'],
-  confirmed: ['processing', 'canceled'],
-  processing: ['cooking', 'canceled'],
+  pending: ['processing', 'confirmed', 'canceled'],
+  processing: ['confirmed', 'canceled'],
+  confirmed: ['cooking', 'canceled'],
   cooking: ['ready_for_serve', 'out_for_delivery', 'canceled'],
-  ready_for_serve: ['completed', 'out_for_delivery', 'canceled'],
+  ready_for_serve: ['out_for_delivery', 'completed', 'canceled'],
   out_for_delivery: ['delivered', 'failed_to_deliver', 'canceled'],
-  delivered: ['returned', 'completed'],
+  delivered: ['completed', 'returned'],
+  failed_to_deliver: ['canceled', 'completed', 'ready_for_serve'],
   completed: [],
   canceled: [],
   returned: [],
-  failed_to_deliver: ['canceled'],
 };
 
 function rid(req) {
@@ -328,6 +405,12 @@ router.post('/:id/ready', asyncHandler(async (req, res) => {
 router.post('/:id/complete', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
   if (!order) throw notFound();
+  if (order.status === 'out_for_delivery' && req.user?.role === 'epos') {
+    throw forbidden('Orders out for delivery must be completed by the rider');
+  }
+  if (order.status === 'ready_for_serve' && order.order_type === 'delivery' && req.user?.role === 'epos') {
+    throw forbidden('Delivery orders must be delivered by the rider before completion');
+  }
   // A delivery that is out on the road is delivered, a ready order at the pass is completed.
   const target = order.status === 'out_for_delivery' ? 'delivered' : 'completed';
   const updated = await changeOrderStatus(req, req.params.id, target, null);
@@ -475,7 +558,11 @@ router.post('/', idempotent('orders'), asyncHandler(async (req, res) => {
   // orders.id is bigint — only accept numeric client ids (EPOS nextOrderId); ignore soft/string ids
   const clientId = body.id != null && /^\d+$/.test(String(body.id)) ? Number(body.id) : null;
   const id = clientId || idRows[0].id;
-  const status = body.status || 'pending';
+  // POS-created orders skip pending and start directly in processing (chef kitchen flow begins immediately).
+  const defaultStatus = req.user?.role === 'epos' ? 'processing' : 'pending';
+  const status = (req.user?.role === 'epos' && (!body.status || body.status === 'pending'))
+    ? 'processing'
+    : (body.status || defaultStatus);
   if (!STATUSES.has(status)) throw badRequest('Invalid status');
   const history = body.history || [{ status, at: new Date().toISOString(), by: req.user?.name || 'API' }];
   // The branch comes only from a validated branch context (X-Branch-Context, checked on every request), never from the
@@ -698,6 +785,7 @@ router.put('/:id', asyncHandler(async (req, res) => {
     }
     assertPaidOrderCanLeave(existing, body.next_status);
     assertRiderForDispatch({ ...existing, data: dataToWrite || existing.data }, body.next_status);
+    assertRoleAllowedTransition(req, existing, body.next_status);
     nextStatus = body.next_status;
   }
   const fields = [
@@ -784,6 +872,7 @@ async function changeOrderStatus(req, orderId, status, note) {
   if (order.status === status) return order;
   assertPaidOrderCanLeave(order, status);
   assertRiderForDispatch(order, status);
+  assertRoleAllowedTransition(req, order, status);
   // Conditional on the status read above (ORD-M2): if another request moved the order first, nothing changes and 409 is returned.
   const { rows } = await pool.query(
     `UPDATE orders SET status = $3, acknowledged = TRUE,
@@ -821,28 +910,68 @@ router.post('/:id/dismiss-alert', asyncHandler(async (req, res) => {
 router.post('/:id/accept', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
   if (!order) throw notFound();
-  if (order.status !== 'pending') throw badRequest('Only pending orders can be accepted');
-  // The kitchen app sends cook_time_minutes and station; the till sends prep_time.
   const body = req.body || {};
-  const prep = Number(body.cook_time_minutes ?? body.prep_time) || 20;
-  const station = body.station ? String(body.station).slice(0, 80) : null;
-  const { rows } = await pool.query(
-    `UPDATE orders SET status = 'confirmed', acknowledged = TRUE,
-       history = COALESCE(history, '[]'::jsonb) || $3::jsonb,
-       data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('prep_time', $4::int, 'station', $5::text),
-       updated_at = NOW()
-     WHERE id = $1 AND restaurant_id = $2 AND status = 'pending' RETURNING *`,
-    [req.params.id, rid(req), historyEntry('confirmed', req.user?.name || 'Staff'), prep, station],
-  );
-  if (!rows[0]) throw staleStatus();
-  ok(res, parseOrder(rows[0]));
+
+  // 1. Pending order -> accepted into processing (POS or Admin)
+  if (order.status === 'pending') {
+    if (req.user?.role === 'chef') {
+      throw forbidden('Only POS or restaurant management can accept pending orders');
+    }
+    const prep = body.cook_time_minutes ?? body.prep_time ? Number(body.cook_time_minutes ?? body.prep_time) : null;
+    const station = body.station ? String(body.station).slice(0, 80) : null;
+    const dataPatch = {};
+    if (prep) dataPatch.prep_time = prep;
+    if (station) dataPatch.station = station;
+
+    const { rows } = await pool.query(
+      `UPDATE orders SET status = 'processing', acknowledged = TRUE,
+         history = COALESCE(history, '[]'::jsonb) || $3::jsonb,
+         data = COALESCE(data, '{}'::jsonb) || $4::jsonb,
+         updated_at = NOW()
+       WHERE id = $1 AND restaurant_id = $2 AND status = 'pending' RETURNING *`,
+      [req.params.id, rid(req), historyEntry('processing', req.user?.name || 'Staff'), JSON.stringify(dataPatch)],
+    );
+    if (!rows[0]) throw staleStatus();
+    const updated = parseOrder(rows[0]);
+    await applyOrderEngines(rid(req), updated, { prevPayment: order.payment_status });
+    return ok(res, updated);
+  }
+
+  // 2. Processing order -> accepted with cook time into confirmed (Chef or Admin)
+  if (order.status === 'processing') {
+    if (req.user?.role === 'epos') {
+      throw forbidden('Only kitchen staff (Chef) can accept orders in processing stage with cook time');
+    }
+    const prep = Number(body.cook_time_minutes ?? body.prep_time) || 20;
+    const station = body.station ? String(body.station).slice(0, 80) : null;
+    const { rows } = await pool.query(
+      `UPDATE orders SET status = 'confirmed', acknowledged = TRUE,
+         history = COALESCE(history, '[]'::jsonb) || $3::jsonb,
+         data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('prep_time', $4::int, 'station', $5::text),
+         updated_at = NOW()
+       WHERE id = $1 AND restaurant_id = $2 AND status = 'processing' RETURNING *`,
+      [req.params.id, rid(req), historyEntry('confirmed', req.user?.name || 'Chef'), prep, station],
+    );
+    if (!rows[0]) throw staleStatus();
+    const updated = parseOrder(rows[0]);
+    await applyOrderEngines(rid(req), updated, { prevPayment: order.payment_status });
+    return ok(res, updated);
+  }
+
+  throw badRequest(`Cannot accept order in status ${order.status}`);
 }));
 
 router.post('/:id/reject', asyncHandler(async (req, res) => {
   const order = await fetchOrder(req.params.id, rid(req), req);
   if (!order) throw notFound();
-  if (!['pending', 'confirmed'].includes(order.status)) {
+  if (!['pending', 'processing', 'confirmed'].includes(order.status)) {
     throw badRequest(`Cannot reject order in status ${order.status}`);
+  }
+  if (order.status === 'pending' && req.user?.role === 'chef') {
+    throw forbidden('Only POS or restaurant management can reject pending orders');
+  }
+  if (['processing', 'confirmed'].includes(order.status) && req.user?.role === 'epos') {
+    throw forbidden('Only kitchen staff (Chef) can reject orders during kitchen preparation');
   }
   // BUG-011: rejecting is a cancel. A paid order must be refunded first, the same as the status route.
   assertPaidOrderCanLeave(order, 'canceled');

@@ -31,11 +31,30 @@ const WEBSITE_STATUS = {
 };
 const websiteStatus = (status) => WEBSITE_STATUS[status] || status;
 
+/** Human-readable status as seen by the customer (image spec). */
+const CUSTOMER_DISPLAY_STATUS = {
+  pending: 'Order placed',
+  processing: 'Waiting for restaurant confirmation',
+  confirmed: 'Order confirmed',
+  cooking: 'Being prepared',
+  ready_for_serve: 'Prepared',
+  out_for_delivery: 'On the way',
+  delivered: 'Delivered',
+  completed: 'Delivered',
+  failed_to_deliver: 'Delivery failed',
+  canceled: 'Canceled',
+  returned: 'Returned',
+};
+const customerDisplayStatus = (status) => CUSTOMER_DISPLAY_STATUS[status] || (status ? String(status).replace(/_/g, ' ') : 'Order placed');
+
 /** The order as the website reads it (order_status, order_amount, payment_method). */
 function orderView(row) {
   return {
     id: String(row.id),
+    status: row.status,
     order_status: websiteStatus(row.status),
+    customer_status: customerDisplayStatus(row.status),
+    display_status: customerDisplayStatus(row.status),
     order_amount: Number(row.total) || 0,
     subtotal: Number(row.subtotal) || 0,
     discount: Number(row.discount) || 0,
@@ -131,7 +150,14 @@ router.get('/details', requireCustomer, asyncHandler(async (req, res) => {
 router.get('/track', requireCustomer, asyncHandler(async (req, res) => {
   const row = await ownOrder(req);
   const history = Array.isArray(row.history) ? row.history : [];
-  ok(res, { order: orderView(row), history: history.map((h) => ({ status: h && h.status ? websiteStatus(String(h.status)) : null, at: h && h.at ? h.at : null })) });
+  ok(res, {
+    order: orderView(row),
+    history: history.map((h) => ({
+      status: h && h.status ? websiteStatus(String(h.status)) : null,
+      display_status: h && h.status ? customerDisplayStatus(String(h.status)) : null,
+      at: h && h.at ? h.at : null,
+    })),
+  });
 }));
 
 /* Cancel: only an order the restaurant has not started (pending). Confirmed orders already ran stock and loyalty
@@ -167,7 +193,7 @@ router.put('/cancel', requireCustomer, asyncHandler(async (req, res) => {
     await client.query('COMMIT');
     ok(res, { id: orderId, order_status: 'canceled' });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client.query('ROLLBACK').catch(() => { });
     throw err;
   } finally {
     client.release();
@@ -191,8 +217,9 @@ router.get('/notifications', requireCustomer, asyncHandler(async (req, res) => {
         id: `${order.id}-${step.status}-${step.at}`,
         order_id: String(order.id),
         title: `Order #${order.id}`,
-        message: `Your order is ${String(step.status).replace(/_/g, ' ')}.`,
+        message: `Your order: ${customerDisplayStatus(step.status)}.`,
         status: step.status,
+        display_status: customerDisplayStatus(step.status),
         created_at: step.at,
       });
     }
