@@ -182,6 +182,116 @@ async function redeemLoyalty(restaurantId, {
   return { customer: rows[0], txn };
 }
 
+/**
+ * Atomically converts a customer's loyalty points into wallet balance inside one DB transaction,
+ * recording both the loyalty debit and wallet credit ledger rows in domain_rows.
+ */
+async function convertLoyaltyToWallet(restaurantId, { customer_id, points, by = null }) {
+  await ensureCommerceDomain();
+  const pts = Math.floor(+points || 0);
+  if (!Number.isFinite(pts) || pts <= 0) {
+    const err = new Error('points must be > 0');
+    err.status = 400; err.code = 'BAD_REQUEST'; throw err;
+  }
+
+  const { rows: restRows } = await pool.query('SELECT data FROM restaurants WHERE id = $1 LIMIT 1', [restaurantId]);
+  const rData = (restRows[0] && restRows[0].data) || {};
+  const exchangeRate = Math.max(1, Number(rData.loyalty_point_exchange_rate) || 100);
+  const minPoints = Math.max(1, Number(rData.loyalty_point_minimum_point) || 100);
+
+  if (pts < minPoints) {
+    const err = new Error(`Minimum ${minPoints} points required`);
+    err.status = 400; err.code = 'BAD_REQUEST'; throw err;
+  }
+  const credit = round2(pts / exchangeRate);
+  if (!credit || credit <= 0) {
+    const err = new Error('Points amount is too small to convert');
+    err.status = 400; err.code = 'BAD_REQUEST'; throw err;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: custRows } = await client.query(
+      'SELECT * FROM customers WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+      [customer_id, restaurantId],
+    );
+    const cust = custRows[0];
+    if (!cust) {
+      const err = new Error('Customer not found');
+      err.status = 400; err.code = 'BAD_REQUEST'; throw err;
+    }
+    const currentPts = Math.floor(+cust.loyalty_points || 0);
+    if (currentPts < pts) {
+      const err = new Error('Insufficient loyalty points');
+      err.status = 400; err.code = 'BAD_REQUEST'; throw err;
+    }
+
+    const { rows: updatedRows } = await client.query(
+      `UPDATE customers
+          SET loyalty_points = COALESCE(loyalty_points, 0) - $3,
+              wallet_balance = COALESCE(wallet_balance, 0) + $4,
+              updated_at = NOW()
+        WHERE id = $1 AND restaurant_id = $2
+        RETURNING *`,
+      [cust.id, restaurantId, pts, credit],
+    );
+    const updated = updatedRows[0];
+    const now = new Date().toISOString();
+    const ref = `conv_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+    const loyaltyId = `loyalty_txns_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+    const walletId = `wallet_txns_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+
+    const loyaltyTxn = {
+      id: loyaltyId,
+      created_at: now,
+      customer_id: cust.id,
+      customer: cust.name,
+      type: 'Point to wallet',
+      credit: 0,
+      debit: pts,
+      balance: +updated.loyalty_points || 0,
+      reference: ref,
+      by,
+    };
+    const walletTxn = {
+      id: walletId,
+      created_at: now,
+      customer_id: cust.id,
+      customer: cust.name,
+      type: 'Loyalty point convert',
+      credit,
+      debit: 0,
+      balance: round2(+updated.wallet_balance),
+      reference: ref,
+      by,
+    };
+
+    await client.query(
+      `INSERT INTO domain_rows (restaurant_id, domain, collection, id, data, updated_at)
+       VALUES ($1, 'commerce', 'loyalty_txns', $2, $3::jsonb, NOW()),
+              ($1, 'commerce', 'wallet_txns', $4, $5::jsonb, NOW())`,
+      [restaurantId, loyaltyId, JSON.stringify(loyaltyTxn), walletId, JSON.stringify(walletTxn)],
+    );
+
+    await client.query('COMMIT');
+    return {
+      customer: updated,
+      converted_points: pts,
+      wallet_credit: credit,
+      loyalty_points: +updated.loyalty_points || 0,
+      wallet_balance: round2(+updated.wallet_balance),
+      loyalty_txn: loyaltyTxn,
+      wallet_txn: walletTxn,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /** A customer lookup that matches no single customer (ambiguous name or email) is a business outcome: no points. */
 function isBusinessRefusal(err) {
   return Boolean(err && (err.status === 400 || err.status === 409));
@@ -327,6 +437,44 @@ async function loyaltyReport(restaurantId, bound = null) {
   return { credit, debit, customer_points: rows[0]?.pts || 0, txns };
 }
 
+/** Customer-scoped wallet or loyalty ledger rows from domain_rows, newest first. */
+async function customerTransactions(restaurantId, customerId, collection, { limit = 30, offset = 0 } = {}) {
+  await ensureCommerceDomain();
+  const safeLimit = Math.min(100, Math.max(1, Number(limit) || 30));
+  const safeOffset = Math.max(0, Number(offset) || 0);
+  const { rows } = await pool.query(
+    `SELECT id, data, updated_at
+       FROM domain_rows
+      WHERE restaurant_id = $1
+        AND domain = 'commerce'
+        AND collection = $2
+        AND data->>'customer_id' = $3
+      ORDER BY COALESCE(data->>'created_at', updated_at::text) DESC
+      LIMIT $4 OFFSET $5`,
+    [restaurantId, collection, String(customerId), safeLimit, safeOffset],
+  );
+  return rows.map((row) => {
+    const d = row.data || {};
+    const credit = Number(d.credit || 0);
+    const debit = Number(d.debit || 0);
+    const points = d.points != null ? Number(d.points) : (credit > 0 ? credit : -debit);
+    return {
+      id: row.id,
+      transaction_id: row.id,
+      transaction_type: d.type || 'transaction',
+      label: d.type || 'transaction',
+      credit,
+      debit,
+      amount: credit > 0 ? credit : 0,
+      points,
+      balance: Number(d.balance || 0),
+      reference: d.reference || null,
+      order_id: d.order_id || null,
+      created_at: d.created_at || row.updated_at,
+    };
+  });
+}
+
 /** Takes back the loyalty points an order earned (ORD-H7 phase 2). Mirrors earnForOrder; never below zero. */
 async function reverseLoyaltyForOrder(restaurantId, order) {
   const cust = order.customer || {};
@@ -360,9 +508,11 @@ module.exports = {
   debitWallet,
   earnLoyalty,
   redeemLoyalty,
+  convertLoyaltyToWallet,
   earnForOrder,
   walletReport,
   loyaltyReport,
+  customerTransactions,
   getCustomer,
   ensureCommerceDomain,
 };

@@ -336,6 +336,158 @@ router.post(
   }),
 );
 
+// ---- Customer Hosted Stripe Checkout (website card payment) ----
+router.post(
+  '/stripe/customer/checkout',
+  asyncHandler(async (req, res) => {
+    if (req.user?.role !== 'customer') throw forbidden('Customer token required');
+    const customerId = String(req.user.sub || '');
+    const rid = String(req.user.restaurant_id || '');
+    const body = req.body || {};
+    const orderId = body.order_id;
+    if (!orderId) throw badRequest('order_id is required');
+
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2', [orderId, rid]);
+    const order = rows[0];
+    if (!order) throw notFound('Order not found');
+    if (String(order.customer_id || '') !== customerId) {
+      throw forbidden('Order belongs to another customer');
+    }
+    const paymentState = String(order.payment_status || '').toLowerCase();
+    const orderState = String(order.status || '').toLowerCase();
+    if (['paid', 'partially_refunded', 'refunded'].includes(paymentState)) {
+      throw conflictError('Order is already paid');
+    }
+    if (['canceled', 'cancelled', 'refunded', 'returned'].includes(orderState)) {
+      throw conflictError('Order is cancelled');
+    }
+
+    const od = order.data && typeof order.data === 'object' ? order.data : {};
+    const amountDue = od.amount_due != null ? Number(od.amount_due) : Number(order.total || 0);
+    if (!(amountDue > 0)) throw badRequest('Order has no remaining balance to pay by card');
+
+    const rawSuccess = String(body.success_url || '').trim();
+    const rawCancel = String(body.cancel_url || '').trim();
+    if (!/^https?:\/\/\S+$/i.test(rawSuccess) || !/^https?:\/\/\S+$/i.test(rawCancel)) {
+      throw badRequest('Valid success_url and cancel_url are required');
+    }
+    const successUrl = rawSuccess.includes('{CHECKOUT_SESSION_ID}')
+      ? rawSuccess
+      : `${rawSuccess}${rawSuccess.includes('?') ? '&' : '?'}session_id={CHECKOUT_SESSION_ID}`;
+
+    const restaurant = await loadRestaurant(rid);
+    const currency = String(restaurant.currency || 'gbp').toLowerCase();
+    const { stripe } = await getStripe();
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency,
+            product_data: { name: `${restaurant.name || 'CraveDash'} Order #${order.id}` },
+            unit_amount: toCents(amountDue),
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: successUrl,
+      cancel_url: rawCancel,
+      metadata: {
+        order_id: String(order.id),
+        restaurant_id: rid,
+        customer_id: customerId,
+        charge_mode: 'platform_first',
+      },
+      payment_intent_data: {
+        metadata: {
+          order_id: String(order.id),
+          restaurant_id: rid,
+          channel: 'online',
+          charge_mode: 'platform_first',
+        },
+      },
+    });
+
+    await pool.query(
+      `UPDATE orders
+          SET payment_method = 'stripe',
+              data = COALESCE(data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [
+        order.id,
+        JSON.stringify({
+          stripe_checkout_session_id: session.id,
+          stripe_payment_intent_id: typeof session.payment_intent === 'string' ? session.payment_intent : null,
+        }),
+      ],
+    );
+
+    ok(res, {
+      checkout_url: session.url,
+      session_id: session.id,
+      order_id: order.id,
+    });
+  }),
+);
+
+router.get(
+  '/stripe/customer/checkout/status',
+  asyncHandler(async (req, res) => {
+    if (req.user?.role !== 'customer') throw forbidden('Customer token required');
+    const customerId = String(req.user.sub || '');
+    const rid = String(req.user.restaurant_id || '');
+    const sessionId = String(req.query.session_id || '').trim();
+    const orderId = req.query.order_id ? String(req.query.order_id).trim() : null;
+    if (!sessionId && !orderId) throw badRequest('session_id or order_id required');
+
+    const { rows } = orderId
+      ? await pool.query('SELECT * FROM orders WHERE id = $1 AND restaurant_id = $2 LIMIT 1', [orderId, rid])
+      : await pool.query(
+          `SELECT * FROM orders WHERE restaurant_id = $1 AND data->>'stripe_checkout_session_id' = $2 LIMIT 1`,
+          [rid, sessionId],
+        );
+    const order = rows[0];
+    if (!order) throw notFound('Order not found');
+    if (String(order.customer_id || '') !== customerId) {
+      throw forbidden('Order belongs to another customer');
+    }
+
+    if (String(order.payment_status || '').toLowerCase() === 'paid') {
+      return ok(res, { paid: true, order_id: order.id, payment_status: 'paid' });
+    }
+
+    const sid = sessionId || (order.data && order.data.stripe_checkout_session_id);
+    if (!sid) {
+      return ok(res, { paid: false, order_id: order.id, payment_status: order.payment_status || 'unpaid' });
+    }
+    const { stripe } = await getStripe();
+    const session = await stripe.checkout.sessions.retrieve(sid);
+    if (session && session.payment_status === 'paid') {
+      const piId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || null;
+      await pool.query(
+        `UPDATE orders
+            SET payment_status = 'paid',
+                payment_method = 'stripe',
+                data = COALESCE(data, '{}'::jsonb) || $2::jsonb,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [
+          order.id,
+          JSON.stringify({
+            stripe_checkout_session_id: session.id,
+            ...(piId ? { stripe_payment_intent_id: piId } : {}),
+            paid_via_checkout_status_at: new Date().toISOString(),
+          }),
+        ],
+      );
+      return ok(res, { paid: true, order_id: order.id, payment_status: 'paid' });
+    }
+
+    ok(res, { paid: false, order_id: order.id, payment_status: order.payment_status || 'unpaid' });
+  }),
+);
+
 // ---- Subscription Checkout (platform) ----
 router.post(
   '/stripe/subscriptions/checkout',
@@ -828,6 +980,30 @@ async function handleStripeEvent(event) {
         row.id,
         JSON.stringify(data),
       ]);
+    }
+    return;
+  }
+
+  if (type === 'checkout.session.completed' && obj.mode === 'payment') {
+    const orderId = obj.metadata?.order_id;
+    if (orderId) {
+      const piId = typeof obj.payment_intent === 'string' ? obj.payment_intent : obj.payment_intent?.id || null;
+      await pool.query(
+        `UPDATE orders
+            SET payment_status = 'paid',
+                payment_method = 'stripe',
+                data = COALESCE(data, '{}'::jsonb) || $2::jsonb,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [
+          orderId,
+          JSON.stringify({
+            stripe_checkout_session_id: obj.id,
+            ...(piId ? { stripe_payment_intent_id: piId } : {}),
+            paid_via_webhook_at: new Date().toISOString(),
+          }),
+        ],
+      );
     }
     return;
   }

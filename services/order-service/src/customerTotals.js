@@ -51,13 +51,15 @@ function deliveryFee({ orderType, subtotal, settings, area }) {
 /**
  * All money for one order. The client's own total, discount and delivery charge are never an input.
  */
-function computeTotals({ subtotal, orderType, settings, area, couponAmount }) {
+function computeTotals({ subtotal, orderType, settings, area, couponAmount, tipAmount }) {
   const sub = round2(subtotal);
   const discount = round2(Math.min(sub, Number(couponAmount) || 0));
   const delivery = deliveryFee({ orderType, subtotal: sub, settings, area });
   const service = isOn(settings.service_fee_status) ? round2(settings.service_fee) : 0;
   const bag = isOn(settings.bag_charge_status) ? round2(settings.bag_charge) : 0;
-  const total = round2(sub - discount + delivery + service + bag);
+  const rawTip = Number(tipAmount);
+  const tip = Number.isFinite(rawTip) && rawTip > 0 ? Math.min(500, round2(rawTip)) : 0;
+  const total = round2(sub - discount + delivery + service + bag + tip);
   return {
     subtotal: sub,
     discount,
@@ -65,6 +67,7 @@ function computeTotals({ subtotal, orderType, settings, area, couponAmount }) {
     service_charge: round2(service + bag),
     service_fee: service,
     bag_charge: bag,
+    tip_amount: tip,
     total,
   };
 }

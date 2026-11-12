@@ -27,6 +27,16 @@ function platformGate(req, res, next) {
   const method = (req.method || 'GET').toUpperCase();
   const p = req.path || '';
 
+  if (role === 'customer') {
+    if (
+      (method === 'POST' && p === '/stripe/customer/checkout') ||
+      (method === 'GET' && p === '/stripe/customer/checkout/status')
+    ) {
+      return next();
+    }
+    return next(forbidden('Customer access is limited to checkout payment'));
+  }
+
   if (role === 'restaurant' || role === 'epos') {
     // Subscription plan prices are for restaurant admins; a till never needs them.
     if (role === 'epos' && /^\/plans(\/|$)/.test(p)) {

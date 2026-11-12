@@ -220,7 +220,7 @@ app.use(proxy('platform', targets.platform, [
   '/api/v1/audit-events',
 ]));
 
-app.use(proxy('auth', targets.auth, ['/api/v1/auth', '/api/v1/customer/info', '/api/v1/customer/address', '/api/v1/customer/wish-list']));
+app.use(proxy('auth', targets.auth, ['/api/v1/auth', '/api/v1/customer/info', '/api/v1/customer/address', '/api/v1/customer/wish-list', '/api/v1/customer/support', '/api/v1/customer/referral', '/api/v1/customer/loyalty-point', '/api/v1/customer/wallet']));
 app.use(proxy('order', targets.order, ['/api/v1/public/check-postcode', '/api/v1/public/delivery-fee']));
 app.use(proxy('catalog', targets.catalog, [
   '/api/v1/public',

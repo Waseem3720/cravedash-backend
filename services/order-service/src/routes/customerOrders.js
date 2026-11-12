@@ -4,6 +4,7 @@
  * Every amount is calculated here (services/order-service/src/customerTotals.js). The client's total, discount and
  * delivery charge are ignored. Staff APIs refuse customer tokens, so this is the only route a customer order goes through.
  */
+const crypto = require('crypto');
 const express = require('express');
 const pool = require('@cravedash/shared/src/db');
 const { created } = require('@cravedash/shared/src/response');
@@ -126,7 +127,46 @@ router.post('/', requireCustomer, asyncHandler(async (req, res) => {
       couponAmount = couponDiscount(subtotal, coupon);
     }
 
-    const totals = computeTotals({ subtotal, orderType, settings, area, couponAmount });
+    const totals = computeTotals({
+      subtotal,
+      orderType,
+      settings,
+      area,
+      couponAmount,
+      tipAmount: body.tip_amount ?? body.tip,
+    });
+    const cutlery = Boolean(body.cutlery);
+    const deliveryDate = body.delivery_date ? String(body.delivery_date).trim().slice(0, 20) : null;
+    const deliveryTime = body.delivery_time ? String(body.delivery_time).trim().slice(0, 20) : null;
+    const isScheduled = Boolean(deliveryTime);
+
+    const paymentMethod = body.payment_method === 'wallet'
+      ? 'wallet'
+      : body.payment_method === 'card'
+        ? 'card'
+        : 'cash';
+    const requestedWallet = round2(Math.max(0, Number(body.wallet_amount) || 0));
+    let walletUsed = 0;
+    if (paymentMethod === 'wallet' || requestedWallet > 0) {
+      const { rows: wCustRows } = await client.query(
+        'SELECT wallet_balance FROM customers WHERE id = $1 AND restaurant_id = $2 FOR UPDATE',
+        [customer.id, restaurant],
+      );
+      const availableWallet = round2(Math.max(0, Number(wCustRows[0]?.wallet_balance) || 0));
+      if (paymentMethod === 'wallet') {
+        if (availableWallet + 0.001 < totals.total) {
+          throw badRequest(`Insufficient wallet balance (have £${availableWallet.toFixed(2)})`);
+        }
+        walletUsed = totals.total;
+      } else {
+        if (requestedWallet > availableWallet + 0.001) {
+          throw badRequest(`Insufficient wallet balance (have £${availableWallet.toFixed(2)})`);
+        }
+        walletUsed = round2(Math.min(requestedWallet, availableWallet, totals.total));
+      }
+    }
+    const amountDue = round2(Math.max(0, totals.total - walletUsed));
+    const paymentStatus = amountDue <= 0 && walletUsed > 0 ? 'paid' : 'unpaid';
 
     const { rows } = await client.query(
       `INSERT INTO orders (
@@ -134,7 +174,7 @@ router.post('/', requireCustomer, asyncHandler(async (req, res) => {
          customer, customer_id, items, subtotal, discount, delivery_charge, service_charge, total,
          coupon_code, note, history, data
        ) VALUES (
-         nextval('orders_id_seq'), $1, $2, $3, 'website', $4, 'pending', 'unpaid',
+         nextval('orders_id_seq'), $1, $2, $3, 'website', $4, 'pending', $17,
          $5::jsonb, $6, $7::jsonb, $8, $9, $10, $11, $12,
          $13, $14, $15::jsonb, $16::jsonb
        ) RETURNING *`,
@@ -160,20 +200,58 @@ router.post('/', requireCustomer, asyncHandler(async (req, res) => {
           postcode: body.postcode ? normalizeCode(body.postcode) : null,
           delivery_area: area ? area.area_name : null,
           delivery_address: orderType === 'delivery' ? deliveryAddressOf(body.delivery_address, body.postcode) : null,
-          payment_method: body.payment_method === 'card' ? 'card' : 'cash',
+          payment_method: paymentMethod,
+          wallet_amount: walletUsed,
+          amount_due: amountDue,
+          tip_amount: totals.tip_amount,
+          cutlery,
+          delivery_date: deliveryDate,
+          delivery_time: deliveryTime,
+          is_scheduled: isScheduled,
           service_fee: totals.service_fee,
           bag_charge: totals.bag_charge,
         }),
+        paymentStatus,
       ],
     );
     row = rows[0];
+
+    if (walletUsed > 0) {
+      const { rows: wUpdated } = await client.query(
+        `UPDATE customers
+            SET wallet_balance = COALESCE(wallet_balance, 0) - $3,
+                updated_at = NOW()
+          WHERE id = $1 AND restaurant_id = $2
+          RETURNING wallet_balance`,
+        [customer.id, restaurant, walletUsed],
+      );
+      const txnId = `wallet_txns_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const txnPayload = {
+        id: txnId,
+        created_at: new Date().toISOString(),
+        customer_id: customer.id,
+        customer: customer.name || null,
+        type: 'Order place',
+        credit: 0,
+        debit: walletUsed,
+        balance: round2(Number(wUpdated[0]?.wallet_balance) || 0),
+        reference: String(row.id),
+        order_id: row.id,
+        by: customer.name || customer.id,
+      };
+      await client.query(
+        `INSERT INTO domain_rows (restaurant_id, domain, collection, id, data, updated_at)
+         VALUES ($1, 'commerce', 'wallet_txns', $2, $3::jsonb, NOW())`,
+        [restaurant, txnId, JSON.stringify(txnPayload)],
+      );
+    }
 
     if (coupon) {
       await client.query('UPDATE coupons SET used = used + 1, updated_at = NOW() WHERE id = $1', [coupon.id]);
     }
     await client.query('COMMIT');
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client.query('ROLLBACK').catch(() => { });
     // A customer_id that does not belong to this restaurant fails the composite foreign key (23503).
     if (err && err.code === '23503') throw badRequest('Customer account not found for this restaurant');
     throw err;

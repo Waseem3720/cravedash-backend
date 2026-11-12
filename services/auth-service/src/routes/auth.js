@@ -895,10 +895,12 @@ router.post('/registration', createRateLimiter({ windowMs: 15 * 60 * 1000, max: 
   const passwordHash = await bcrypt.hash(password, 10);
   const id = `cust_${crypto.randomBytes(8).toString('hex')}`;
   const name = lastName ? `${firstName} ${lastName}` : firstName;
+  const referPrefix = String(name || 'USER').replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase() || 'USER';
+  const referCode = `${referPrefix}${id.slice(-4).toUpperCase()}`;
   const { rows } = await pool.query(
     `INSERT INTO customers (id, restaurant_id, name, email, phone, password_hash, data, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW()) RETURNING id, name, email, phone`,
-    [id, restaurantId, name, email, phone, passwordHash, JSON.stringify({ marketing_consent: body.marketing_consent === true })],
+    [id, restaurantId, name, email, phone, passwordHash, JSON.stringify({ marketing_consent: body.marketing_consent === true, refer_code: referCode })],
   );
   const customer = rows[0];
   const token = sign({
@@ -910,7 +912,7 @@ router.post('/registration', createRateLimiter({ windowMs: 15 * 60 * 1000, max: 
   });
   ok(res, {
     token,
-    user: { id: customer.id, name: customer.name, phone: customer.phone, email: customer.email, role: 'customer', restaurant_id: restaurantId },
+    user: { id: customer.id, name: customer.name, phone: customer.phone, email: customer.email, role: 'customer', restaurant_id: restaurantId, refer_code: referCode },
   });
 }));
 
