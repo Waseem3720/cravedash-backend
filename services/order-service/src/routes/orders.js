@@ -842,6 +842,19 @@ router.put('/:id', asyncHandler(async (req, res) => {
   const updated = parseOrder(rows[0]);
   await applyOrderEngines(rid(req), updated, { prevPayment: existing.payment_status });
   if (nextStatus && ['canceled', 'returned'].includes(nextStatus)) await applyOrderReversal(rid(req), updated);
+  if (nextStatus === 'processing') {
+    pool.query(
+      'INSERT INTO kitchen_notifications (id, restaurant_id, branch_id, title, message, order_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [
+        `notif_${updated.id}_${Date.now().toString(36)}`,
+        rid(req),
+        updated.branch_id === 'main' ? null : updated.branch_id,
+        `New ${String(updated.order_type || 'order').replace('_', '-')} order #${updated.id}`,
+        `Order #${updated.id} for £${Number(updated.total || 0).toFixed(2)} received`,
+        String(updated.id),
+      ],
+    ).catch((err) => console.error('[orders] kitchen alert not saved', err.message));
+  }
   ok(res, await autoAssignAfterCooking(rid(req), updated, req.user?.name || 'Staff'));
 }));
 

@@ -226,7 +226,7 @@ async function createOrderOnce(req, r, key, clientId, payload) {
       );
       serverId = String(rows[0].id);
       result = { created: true };
-      created = { id, orderBranch, paymentStatus, customer: payload.customer };
+      created = { id, orderBranch, paymentStatus, customer: payload.customer, orderType: payload.order_type, total, status: syncStatus };
     }
 
     await client.query(
@@ -244,6 +244,20 @@ async function createOrderOnce(req, r, key, clientId, payload) {
       if (created.paymentStatus === 'paid') {
         const { rows: saved } = await pool.query('SELECT * FROM orders WHERE id = $1', [created.id]);
         await applyOrderEngines(r, saved[0], { prevPayment: 'unpaid' });
+      }
+      // Kitchen alert for chef displays and notifications (cheff.md)
+      if (['processing', 'pending', 'confirmed'].includes(created.status)) {
+        pool.query(
+          'INSERT INTO kitchen_notifications (id, restaurant_id, branch_id, title, message, order_id) VALUES ($1, $2, $3, $4, $5, $6)',
+          [
+            `notif_${created.id}_${Date.now().toString(36)}`,
+            r,
+            created.orderBranch === 'main' ? null : created.orderBranch,
+            `New ${String(created.orderType || 'order').replace('_', '-')} order #${created.id}`,
+            `Order #${created.id} for £${Number(created.total || 0).toFixed(2)} received`,
+            String(created.id),
+          ],
+        ).catch((err) => console.error('[sync] kitchen alert not saved', err.message));
       }
     }
     return { key, status: 'acked', server_id: serverId, client_id: clientId, result };
